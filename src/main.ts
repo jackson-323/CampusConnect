@@ -361,24 +361,77 @@ function renderAccountStatus(feedback?: string, isError = false): void {
         const refreshedUser = auth.currentUser;
         if (!refreshedUser) throw new Error("The signed-in session is no longer available.");
         currentUser = refreshedUser;
+
+        if (!refreshedUser.emailVerified) {
+          renderAccountStatus(
+            "Firebase still reports this email as unverified. Open the link in your verification email, then try again.",
+            true
+          );
+          return;
+        }
+
+        try {
+          await setDoc(doc(db, "users", refreshedUser.uid), {
+            emailVerified: true,
+            updatedAt: serverTimestamp()
+          }, { merge: true });
+        } catch (error) {
+          console.error("Could not sync verified email status to UID profile:", error);
+          renderAccountStatus(
+            "Firebase confirms your email is verified, but the canonical student profile could not be updated. The legacy profile was not changed.",
+            true
+          );
+          return;
+        }
+
         if (currentProfile) {
-          currentProfile = { ...currentProfile, emailVerified: refreshedUser.emailVerified };
+          currentProfile = { ...currentProfile, emailVerified: true };
+        }
+
+        const legacyDocumentId =
+          currentProfile?.legacyDocumentId ?? refreshedUser.email;
+        if (!legacyDocumentId || legacyDocumentId === refreshedUser.uid) {
+          renderAccountStatus(
+            "Email verified and the canonical UID profile was updated. No separate legacy profile could be identified."
+          );
+          return;
+        }
+
+        let legacyProfileExists: boolean;
+        try {
+          const legacySnap = await getDoc(doc(db, "users", legacyDocumentId));
+          legacyProfileExists = legacySnap.exists();
+        } catch (error) {
+          console.error("Could not check for a legacy email profile:", error);
+          renderAccountStatus(
+            "Email verified and the canonical UID profile was updated, but the legacy profile could not be checked or synchronized.",
+            true
+          );
+          return;
+        }
+
+        if (legacyProfileExists) {
           try {
-            await setDoc(doc(db, "users", refreshedUser.uid), {
-              emailVerified: refreshedUser.emailVerified,
+            await setDoc(doc(db, "users", legacyDocumentId), {
+              emailVerified: true,
               updatedAt: serverTimestamp()
             }, { merge: true });
           } catch (error) {
-            console.error("Could not sync email verification status to profile:", error);
-            renderAccountStatus("Email verification was refreshed, but the profile status could not be synced to Firestore.", true);
+            console.error("Could not sync verified email status to legacy profile:", error);
+            renderAccountStatus(
+              "Email verified and the canonical UID profile was updated, but the existing legacy profile could not be synchronized.",
+              true
+            );
             return;
           }
+          renderAccountStatus(
+            "Email verified and synchronized to the canonical and legacy profiles. University student verification is separate."
+          );
+          return;
         }
+
         renderAccountStatus(
-          refreshedUser.emailVerified
-            ? "Email address verified. University student verification is still separate."
-            : "Firebase still reports this email as unverified. Open the link in your verification email, then try again.",
-          !refreshedUser.emailVerified
+          "Email verified and the canonical UID profile was updated. No legacy email-keyed profile was found. University student verification is separate."
         );
       } catch (error) {
         console.error("Could not refresh email verification status:", error);
@@ -634,6 +687,18 @@ function showRegister() {
     const password = String(formData.get("password") ?? "");
     const passwordConfirm = String(formData.get("passwordConfirm") ?? "");
 
+    if (!fullName) {
+      setAuthFeedback("Full name cannot be empty.");
+      return;
+    }
+    if (!username) {
+      setAuthFeedback("Username cannot be empty.");
+      return;
+    }
+    if (!course) {
+      setAuthFeedback("Course or programme cannot be empty.");
+      return;
+    }
     if (password !== passwordConfirm) {
       setAuthFeedback("The passwords do not match.");
       return;
