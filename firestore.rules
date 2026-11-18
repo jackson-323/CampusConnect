@@ -1,0 +1,691 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn() && request.auth.token.admin == true;
+    }
+
+    function isNumeric(value) {
+      return value is int || value is float;
+    }
+
+    function uidProfilePath(userId) {
+      return /databases/$(database)/documents/users/$(userId);
+    }
+
+    function legacyProfilePath(emailId) {
+      return /databases/$(database)/documents/users/$(emailId);
+    }
+
+    function publicProfilePath(publicProfileId) {
+      return /databases/$(database)/documents/publicProfiles/$(publicProfileId);
+    }
+
+    function publicProfileOwnerPath(publicProfileId) {
+      return /databases/$(database)/documents/publicProfileOwners/$(publicProfileId);
+    }
+
+    function ownsUidProfile(userId) {
+      return signedIn()
+        && request.auth.uid == userId
+        && (!exists(uidProfilePath(userId))
+          || get(uidProfilePath(userId)).data.uid == request.auth.uid);
+    }
+
+    function ownsLegacyProfile(emailId) {
+      return signedIn()
+        && request.auth.token.email is string
+        && request.auth.token.email == emailId
+        && (!exists(legacyProfilePath(emailId))
+          || (get(legacyProfilePath(emailId)).data.email == request.auth.token.email
+            && (!('uid' in get(legacyProfilePath(emailId)).data)
+              || get(legacyProfilePath(emailId)).data.uid == request.auth.uid)));
+    }
+
+    function validProfile(userId) {
+      return request.resource.data.keys().hasOnly([
+          'uid',
+          'fullName',
+          'username',
+          'email',
+          'universityId',
+          'campusId',
+          'course',
+          'yearOfStudy',
+          'year',
+          'role',
+          'emailVerified',
+          'verificationStatus',
+          'createdAt',
+          'updatedAt',
+          'skills',
+          'photoURL',
+          'discoverable',
+          'publicProfileId'
+        ])
+        && request.resource.data.keys().hasAll([
+          'uid',
+          'fullName',
+          'username',
+          'email',
+          'universityId',
+          'campusId',
+          'course',
+          'yearOfStudy',
+          'role',
+          'emailVerified',
+          'verificationStatus',
+          'createdAt',
+          'updatedAt',
+          'discoverable'
+        ])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.role == 'student'
+        && request.resource.data.emailVerified == request.auth.token.email_verified
+        && request.resource.data.verificationStatus == 'unverified'
+        && request.resource.data.fullName is string
+        && request.resource.data.fullName.size() > 0
+        && request.resource.data.fullName.size() <= 100
+        && request.resource.data.username is string
+        && request.resource.data.username.size() > 0
+        && request.resource.data.username.size() <= 30
+        && request.resource.data.universityId is string
+        && request.resource.data.universityId.size() > 0
+        && request.resource.data.universityId.size() <= 100
+        && request.resource.data.course is string
+        && request.resource.data.course.size() <= 120
+        && (request.resource.data.campusId == null
+          || request.resource.data.campusId is string)
+        && (request.resource.data.yearOfStudy == null
+          || (request.resource.data.yearOfStudy is int
+            && request.resource.data.yearOfStudy >= 1
+            && request.resource.data.yearOfStudy <= 8))
+        && (!('year' in request.resource.data)
+          || (request.resource.data.year is string
+            && request.resource.data.year.size() <= 20))
+        && request.resource.data.createdAt is timestamp
+        && request.resource.data.updatedAt is timestamp
+        && request.resource.data.discoverable is bool
+        && (!('publicProfileId' in request.resource.data)
+          || (request.resource.data.publicProfileId is string
+            && get(publicProfileOwnerPath(request.resource.data.publicProfileId)).data.uid
+              == request.auth.uid))
+        && (!('skills' in request.resource.data)
+          || (request.resource.data.skills is string
+            && request.resource.data.skills.size() <= 500))
+        && (!('photoURL' in request.resource.data)
+          || (request.resource.data.photoURL is string
+            && request.resource.data.photoURL.size() <= 700000));
+    }
+
+    function validProfileUpdate(userId) {
+      return (!('uid' in resource.data)
+          || request.resource.data.uid == resource.data.uid)
+        && (!('email' in resource.data)
+          || request.resource.data.email == resource.data.email)
+        && (!('role' in resource.data)
+          || request.resource.data.role == resource.data.role)
+        && (!('emailVerified' in resource.data)
+          || request.resource.data.emailVerified == resource.data.emailVerified)
+        && (!('verificationStatus' in resource.data)
+          || request.resource.data.verificationStatus == resource.data.verificationStatus)
+        && (!('createdAt' in resource.data)
+          || request.resource.data.createdAt == resource.data.createdAt)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'course',
+          'yearOfStudy',
+          'year',
+          'skills',
+          'photoURL',
+          'updatedAt',
+          'discoverable',
+          'publicProfileId'
+        ])
+        && request.resource.data.updatedAt == request.time
+        && (!('discoverable' in request.resource.data)
+          || request.resource.data.discoverable is bool)
+        && (
+          !('publicProfileId' in resource.data)
+            ? (!('publicProfileId' in request.resource.data)
+              || (request.resource.data.publicProfileId is string
+                && getAfter(publicProfileOwnerPath(request.resource.data.publicProfileId)).data.uid
+                  == request.auth.uid))
+            : request.resource.data.publicProfileId == resource.data.publicProfileId
+        )
+        && request.resource.data.course is string
+        && request.resource.data.course.size() <= 120
+        && (request.resource.data.yearOfStudy == null
+          || (request.resource.data.yearOfStudy is int
+            && request.resource.data.yearOfStudy >= 1
+            && request.resource.data.yearOfStudy <= 8))
+        && (!('year' in request.resource.data)
+          || (request.resource.data.year is string
+            && request.resource.data.year.size() <= 20))
+        && (!('skills' in request.resource.data)
+          || (request.resource.data.skills is string
+            && request.resource.data.skills.size() <= 500))
+        && (!('photoURL' in request.resource.data)
+          || (request.resource.data.photoURL is string
+            && request.resource.data.photoURL.size() <= 700000));
+    }
+
+    function safePublicProfile(data, publicProfileId) {
+      return data.keys().hasOnly([
+          'ownerUid',
+          'publicProfileId',
+          'fullName',
+          'username',
+          'universityId',
+          'course',
+          'yearOfStudy',
+          'skills',
+          'photoURL',
+          'discoverable'
+        ])
+        && data.keys().hasAll([
+          'fullName',
+          'username',
+          'universityId',
+          'course',
+          'yearOfStudy',
+          'skills',
+          'photoURL',
+          'discoverable'
+        ])
+        && (!('ownerUid' in data) || data.ownerUid is string)
+        && (!('publicProfileId' in data) || data.publicProfileId == publicProfileId)
+        && data.fullName is string
+        && data.fullName.size() > 0
+        && data.fullName.size() <= 100
+        && data.username is string
+        && data.username.size() > 0
+        && data.username.size() <= 30
+        && data.universityId is string
+        && data.universityId.size() > 0
+        && data.universityId.size() <= 100
+        && data.course is string
+        && data.course.size() <= 120
+        && (data.yearOfStudy == null
+          || (data.yearOfStudy is int
+            && data.yearOfStudy >= 1
+            && data.yearOfStudy <= 12))
+        && data.skills is string
+        && data.skills.size() <= 500
+        && data.photoURL is string
+        && data.photoURL.size() <= 700000
+        && data.discoverable is bool;
+    }
+
+    function publicProjectionMatches(data, source) {
+      return data.fullName == source.fullName
+        && data.username == source.username
+        && data.universityId == source.universityId
+        && data.course == source.course
+        && data.yearOfStudy == source.yearOfStudy
+        && ((!('skills' in source) && data.skills == '')
+          || ('skills' in source && data.skills == source.skills))
+        && ((!('photoURL' in source) && data.photoURL == '')
+          || ('photoURL' in source && data.photoURL == source.photoURL));
+    }
+
+    function validPublicProfileWrite(publicProfileId) {
+      let profile = request.resource.data;
+      let owner = getAfter(publicProfileOwnerPath(publicProfileId));
+      let user = getAfter(uidProfilePath(request.auth.uid));
+      return signedIn()
+        && safePublicProfile(profile, publicProfileId)
+        && profile.ownerUid == request.auth.uid
+        && profile.publicProfileId == publicProfileId
+        && owner.data.uid == request.auth.uid
+        && user.data.publicProfileId == publicProfileId
+        && user.data.discoverable == true
+        && profile.discoverable == true
+        && publicProjectionMatches(profile, user.data);
+    }
+
+    function validProfileSnapshot(snapshot, publicProfileId) {
+      return snapshot is map
+        && snapshot.keys().hasOnly([
+          'publicProfileId',
+          'fullName',
+          'username',
+          'universityId',
+          'course',
+          'yearOfStudy',
+          'skills',
+          'photoURL'
+        ])
+        && snapshot.keys().hasAll([
+          'publicProfileId',
+          'fullName',
+          'username',
+          'universityId',
+          'course',
+          'yearOfStudy',
+          'skills',
+          'photoURL'
+        ])
+        && snapshot.publicProfileId == publicProfileId
+        && snapshot.fullName is string
+        && snapshot.fullName.size() <= 100
+        && snapshot.username is string
+        && snapshot.username.size() <= 30
+        && snapshot.universityId is string
+        && snapshot.universityId.size() <= 100
+        && snapshot.course is string
+        && snapshot.course.size() <= 120
+        && (snapshot.yearOfStudy == null
+          || (snapshot.yearOfStudy is int && snapshot.yearOfStudy >= 1 && snapshot.yearOfStudy <= 12))
+        && snapshot.skills is string
+        && snapshot.skills.size() <= 500
+        && snapshot.photoURL is string
+        && snapshot.photoURL.size() <= 150000;
+    }
+
+    function snapshotMatchesSource(snapshot, publicProfileId, source) {
+      return validProfileSnapshot(snapshot, publicProfileId)
+        && snapshot.fullName == source.fullName
+        && snapshot.username == source.username
+        && snapshot.universityId == source.universityId
+        && snapshot.course == source.course
+        && snapshot.yearOfStudy == source.yearOfStudy
+        && ((!('skills' in source) && snapshot.skills == '')
+          || ('skills' in source && snapshot.skills == source.skills))
+        && ((!('photoURL' in source) && snapshot.photoURL == '')
+          || ('photoURL' in source
+            && snapshot.photoURL == (source.photoURL.size() <= 150000 ? source.photoURL : '')));
+    }
+
+    function connectionParticipant() {
+      return signedIn()
+        && resource.data.participantUids is list
+        && resource.data.participantUids.size() == 2
+        && resource.data.participantUids[0] is string
+        && resource.data.participantUids[1] is string
+        && resource.data.participantUids[0] != resource.data.participantUids[1]
+        && resource.data.participantUids.hasAny([request.auth.uid])
+        && resource.data.requesterUid is string
+        && resource.data.recipientUid is string
+        && resource.data.requesterUid != resource.data.recipientUid
+        && resource.data.participantUids.hasAny([resource.data.requesterUid])
+        && resource.data.participantUids.hasAny([resource.data.recipientUid])
+        && resource.data.status in ['pending', 'accepted', 'rejected', 'cancelled'];
+    }
+
+    function connectionInvolvesUser() {
+      return signedIn()
+        && request.auth.uid in resource.data.participantUids;
+    }
+
+    function validParticipantPair(data) {
+      return data.participantUids is list
+        && data.participantUids.size() == 2
+        && data.participantUids[0] is string
+        && data.participantUids[1] is string
+        && data.participantUids[0] < data.participantUids[1]
+        && data.participantUids[0].matches('^[A-Za-z0-9-]+$')
+        && data.participantUids[1].matches('^[A-Za-z0-9-]+$')
+        && data.participantProfileIds is list
+        && data.participantProfileIds.size() == 2
+        && data.participantProfileIds[0] is string
+        && data.participantProfileIds[1] is string;
+    }
+
+    function validConnectionFields(data, pairId) {
+      return data.keys().hasOnly([
+          'pairId',
+          'participantUids',
+          'participantProfileIds',
+          'requesterUid',
+          'recipientUid',
+          'requesterProfile',
+          'recipientProfile',
+          'status',
+          'createdAt',
+          'updatedAt',
+          'updatedByUid'
+        ])
+        && data.pairId == pairId
+        && validParticipantPair(data)
+        && data.requesterUid is string
+        && data.recipientUid is string
+        && data.requesterUid != data.recipientUid
+        && data.participantUids.hasAny([data.requesterUid])
+        && data.participantUids.hasAny([data.recipientUid])
+        && data.status in ['pending', 'accepted', 'rejected', 'cancelled']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp
+        && data.updatedByUid is string;
+    }
+
+    function validNewConnection(pairId) {
+      let data = request.resource.data;
+      let own = get(uidProfilePath(request.auth.uid)).data;
+      let ownIndex = data.participantUids[0] == request.auth.uid ? 0 : 1;
+      let targetIndex = ownIndex == 0 ? 1 : 0;
+      let target = get(publicProfilePath(data.participantProfileIds[targetIndex])).data;
+      return signedIn()
+        && validConnectionFields(data, pairId)
+        && pairId == 'pair_' + data.participantUids[0] + '~' + data.participantUids[1]
+        && data.requesterUid == request.auth.uid
+        && data.status == 'pending'
+        && data.updatedByUid == request.auth.uid
+        && data.createdAt == request.time
+        && data.updatedAt == request.time
+        && data.participantProfileIds[ownIndex] == own.publicProfileId
+        && target.ownerUid == data.participantUids[targetIndex]
+        && target.discoverable == true
+        && snapshotMatchesSource(data.requesterProfile, own.publicProfileId, own)
+        && snapshotMatchesSource(
+          data.recipientProfile,
+          data.participantProfileIds[targetIndex],
+          target
+        );
+    }
+
+    function validConnectionUpdate(pairId) {
+      let data = request.resource.data;
+      let old = resource.data;
+      let sameParticipants = data.participantUids == old.participantUids
+        && data.participantProfileIds == old.participantProfileIds
+        && data.pairId == old.pairId
+        && data.createdAt == old.createdAt;
+      let reopensRequest = old.status in ['rejected', 'cancelled']
+        && data.status == 'pending'
+        && data.requesterUid == request.auth.uid
+        && data.recipientUid != request.auth.uid
+        && data.participantUids.hasAny([data.recipientUid]);
+      let respondsToRequest = old.status == 'pending'
+        && old.recipientUid == request.auth.uid
+        && data.requesterUid == old.requesterUid
+        && data.recipientUid == old.recipientUid
+        && data.status in ['accepted', 'rejected'];
+      let cancelsRequest = old.status == 'pending'
+        && old.requesterUid == request.auth.uid
+        && data.requesterUid == old.requesterUid
+        && data.recipientUid == old.recipientUid
+        && data.status == 'cancelled';
+      let removesConnection = old.status == 'accepted'
+        && request.auth.uid in old.participantUids
+        && data.requesterUid == old.requesterUid
+        && data.recipientUid == old.recipientUid
+        && data.status == 'cancelled';
+      let actionChangesOnlyStatus = data.diff(old).affectedKeys().hasOnly([
+        'status',
+        'updatedAt',
+        'updatedByUid'
+      ]);
+      let actionReopensWithSafeSnapshots = reopensRequest
+        && data.diff(old).affectedKeys().hasOnly([
+          'requesterUid',
+          'recipientUid',
+          'requesterProfile',
+          'recipientProfile',
+          'status',
+          'updatedAt',
+          'updatedByUid'
+        ])
+        && validNewConnectionSnapshotData(data);
+      return signedIn()
+        && validConnectionFields(data, pairId)
+        && sameParticipants
+        && data.updatedAt == request.time
+        && data.updatedByUid == request.auth.uid
+        && (
+          (actionReopensWithSafeSnapshots)
+          || ((respondsToRequest || cancelsRequest || removesConnection)
+            && actionChangesOnlyStatus)
+        );
+    }
+
+    function validNewConnectionSnapshotData(data) {
+      let own = get(uidProfilePath(request.auth.uid)).data;
+      let ownIndex = data.participantUids[0] == request.auth.uid ? 0 : 1;
+      let targetIndex = ownIndex == 0 ? 1 : 0;
+      let target = get(publicProfilePath(data.participantProfileIds[targetIndex])).data;
+      return target.ownerUid == data.participantUids[targetIndex]
+        && target.discoverable == true
+        && data.participantProfileIds[ownIndex] == own.publicProfileId
+        && snapshotMatchesSource(data.requesterProfile, own.publicProfileId, own)
+        && snapshotMatchesSource(
+          data.recipientProfile,
+          data.participantProfileIds[targetIndex],
+          target
+        );
+    }
+
+    function chatParticipant() {
+      return signedIn()
+        && resource.data.participantUids is list
+        && resource.data.participantUids.size() == 2
+        && request.auth.uid in resource.data.participantUids;
+    }
+
+    function validNewChat(chatId) {
+      let data = request.resource.data;
+      let ownIndex = data.participantUids[0] == request.auth.uid ? 0 : 1;
+      let targetIndex = ownIndex == 0 ? 1 : 0;
+      let own = get(uidProfilePath(request.auth.uid)).data;
+      let target = get(publicProfilePath(data.participantProfileIds[targetIndex])).data;
+      return signedIn()
+        && data.keys().hasOnly([
+          'participantUids',
+          'participantProfileIds',
+          'createdAt',
+          'updatedAt'
+        ])
+        && validParticipantPair(data)
+        && chatId == 'chat_' + data.participantUids[0] + '~' + data.participantUids[1]
+        && request.auth.uid in data.participantUids
+        && data.participantProfileIds[ownIndex] == own.publicProfileId
+        && target.ownerUid == data.participantUids[targetIndex]
+        && target.discoverable == true
+        && data.createdAt == request.time
+        && data.updatedAt == request.time;
+    }
+
+    function validHostel(data) {
+      return data.keys().hasOnly([
+          'name',
+          'rent',
+          'water',
+          'wifi',
+          'lat',
+          'lng',
+          'distanceKm',
+          'durationMin',
+          'ownerUid',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.name is string
+        && data.name.size() > 0
+        && data.name.size() <= 120
+        && isNumeric(data.rent)
+        && data.rent >= 0
+        && data.water is bool
+        && data.wifi is bool
+        && isNumeric(data.lat)
+        && data.lat >= -90
+        && data.lat <= 90
+        && isNumeric(data.lng)
+        && data.lng >= -180
+        && data.lng <= 180
+        && (!('distanceKm' in data)
+          || data.distanceKm == null
+          || (isNumeric(data.distanceKm) && data.distanceKm >= 0))
+        && (!('durationMin' in data)
+          || data.durationMin == null
+          || (isNumeric(data.durationMin) && data.durationMin >= 0))
+        && (!('ownerUid' in data) || data.ownerUid is string)
+        && (!('createdAt' in data) || data.createdAt is timestamp)
+        && (!('updatedAt' in data) || data.updatedAt is timestamp);
+    }
+
+    match /users/{userId} {
+      allow get: if isAdmin() || ownsUidProfile(userId) || ownsLegacyProfile(userId);
+      allow list: if isAdmin();
+      allow create: if signedIn()
+        && (userId == request.auth.uid || userId == request.auth.token.email)
+        && validProfile(userId);
+      allow update: if (ownsUidProfile(userId) || ownsLegacyProfile(userId))
+        && validProfileUpdate(userId);
+      allow delete: if false;
+    }
+
+    match /publicProfiles/{publicProfileId} {
+      allow get: if signedIn()
+        && resource.data.discoverable == true
+        && safePublicProfile(resource.data, publicProfileId);
+      allow list: if signedIn() && resource.data.discoverable == true;
+      allow create: if validPublicProfileWrite(publicProfileId);
+      allow update: if signedIn()
+        && (resource.data.ownerUid == request.auth.uid
+          || get(publicProfileOwnerPath(publicProfileId)).data.uid == request.auth.uid)
+        && validPublicProfileWrite(publicProfileId);
+      allow delete: if signedIn()
+        && get(publicProfileOwnerPath(publicProfileId)).data.uid == request.auth.uid
+        && getAfter(uidProfilePath(request.auth.uid)).data.publicProfileId == publicProfileId
+        && getAfter(uidProfilePath(request.auth.uid)).data.discoverable == false;
+    }
+
+    match /publicProfileOwners/{publicProfileId} {
+      allow get, list: if false;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == request.auth.uid
+        && !exists(publicProfileOwnerPath(publicProfileId))
+        && (!exists(publicProfilePath(publicProfileId))
+          || get(publicProfilePath(publicProfileId)).data.ownerUid == request.auth.uid)
+        && getAfter(uidProfilePath(request.auth.uid)).data.publicProfileId == publicProfileId;
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == resource.data.uid;
+      allow delete: if false;
+    }
+
+    match /connections/{pairId} {
+      allow get: if connectionParticipant();
+      allow list: if connectionInvolvesUser();
+      allow create: if validNewConnection(pairId);
+      allow update: if validConnectionUpdate(pairId);
+      allow delete: if false;
+    }
+
+    match /chats/{chatId} {
+      allow get: if chatParticipant();
+      allow list: if signedIn() && request.auth.uid in resource.data.participantUids;
+      allow create: if validNewChat(chatId);
+      allow update, delete: if false;
+
+      match /messages/{messageId} {
+        function chatParticipant() {
+          let chat = get(/databases/$(database)/documents/chats/$(chatId));
+          return signedIn()
+            && chat.data.participantUids is list
+            && chat.data.participantUids.size() == 2
+            && request.auth.uid in chat.data.participantUids;
+        }
+
+        allow get, list: if chatParticipant();
+        allow create: if chatParticipant()
+          && request.resource.data.keys().hasOnly([
+            'text',
+            'sender',
+            'senderUid',
+            'createdAt'
+          ])
+          && request.resource.data.keys().hasAll([
+            'text',
+            'sender',
+            'senderUid',
+            'createdAt'
+          ])
+          && request.resource.data.senderUid == request.auth.uid
+          && request.resource.data.sender == request.auth.token.email
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 4000
+          && request.resource.data.createdAt == request.time;
+        allow update, delete: if false;
+      }
+    }
+
+    match /hostels/{hostelId} {
+      allow get, list: if signedIn();
+      allow create: if signedIn()
+        && (isAdmin() || request.resource.data.ownerUid == request.auth.uid)
+        && request.resource.data.ownerUid is string
+        && validHostel(request.resource.data);
+      allow update: if signedIn()
+        && (isAdmin() || resource.data.ownerUid == request.auth.uid)
+        && (
+          ('ownerUid' in resource.data
+            && request.resource.data.ownerUid == resource.data.ownerUid)
+          || (isAdmin()
+            && !('ownerUid' in resource.data)
+            && !('ownerUid' in request.resource.data))
+        )
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name',
+          'rent',
+          'water',
+          'wifi',
+          'lat',
+          'lng',
+          'distanceKm',
+          'durationMin',
+          'updatedAt'
+        ])
+        && validHostel(request.resource.data);
+      allow delete: if signedIn()
+        && (isAdmin() || resource.data.ownerUid == request.auth.uid);
+    }
+
+    match /announcements/{announcementId} {
+      allow get, list: if signedIn();
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly([
+          'title',
+          'message',
+          'type',
+          'author',
+          'createdAt',
+          'pinned'
+        ])
+        && request.resource.data.keys().hasAll([
+          'title',
+          'message',
+          'type',
+          'author',
+          'createdAt',
+          'pinned'
+        ])
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 150
+        && request.resource.data.message is string
+        && request.resource.data.message.size() > 0
+        && request.resource.data.message.size() <= 5000
+        && request.resource.data.type in ['general', 'event', 'urgent']
+        && request.resource.data.author is string
+        && request.resource.data.author.size() <= 100
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.pinned == false;
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pinned'])
+        && request.resource.data.pinned is bool;
+      allow delete: if isAdmin();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

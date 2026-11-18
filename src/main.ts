@@ -29,6 +29,8 @@ import {
   getDoc,
   getDocs,
   where,
+  documentId,
+  runTransaction,
   type DocumentData,
   type DocumentSnapshot
 } from "firebase/firestore";
@@ -59,12 +61,40 @@ type StudentProfile = {
   updatedAt: unknown;
   skills?: string;
   photoURL?: string;
+  discoverable: boolean;
+  publicProfileId?: string;
   legacyDocumentId?: string;
 };
 
-type ProfileDocument = {
+type DiscoverableStudent = {
+  publicProfileId: string;
+  fullName: string;
+  username: string;
+  universityId: string;
+  course: string;
+  yearOfStudy: number | null;
+  skills: string;
+  photoURL: string;
+};
+
+type ConnectionStatus = "pending" | "accepted" | "rejected" | "cancelled";
+type ConnectionRecord = {
   id: string;
-  data: DocumentData;
+  participantUids: string[];
+  participantProfileIds: string[];
+  requesterUid: string;
+  recipientUid: string;
+  status: ConnectionStatus;
+  createdAt: unknown;
+  updatedAt: unknown;
+  updatedByUid?: string;
+  requesterProfile?: StudentProfileSnapshot;
+  recipientProfile?: StudentProfileSnapshot;
+};
+
+type ConnectionAction = "request" | "accept" | "reject" | "cancel" | "remove";
+type StudentProfileSnapshot = Omit<DiscoverableStudent, "publicProfileId"> & {
+  publicProfileId: string;
 };
 
 const MASENO = {
@@ -95,11 +125,16 @@ const app = document.querySelector("#app") as HTMLElement;
 let currentUser: User | null = null;
 let currentProfile: StudentProfile | null = null;
 let currentRole: StudentRole = "student";
+let currentIsAdmin = false;
 let currentUsername: string | null = null;
 let currentEmail: string | null = null;
 let registrationInProgress = false;
 let pendingRegistrationProfile: StudentProfile | null = null;
 let authProfileError: string | null = null;
+let studentDiscoveryUnsubscribe: (() => void) | null = null;
+let discoveryConnectionsUnsubscribe: (() => void) | null = null;
+let connectionScreenUnsubscribe: (() => void) | null = null;
+let profileConnectionUnsubscribe: (() => void) | null = null;
 
 function isStudentRole(value: unknown): value is StudentRole {
   return value === "student" || value === "moderator" || value === "admin";
@@ -179,6 +214,10 @@ function createStudentProfile(
     updatedAt: data.updatedAt ?? serverTimestamp(),
     ...(typeof data.skills === "string" ? { skills: data.skills } : {}),
     ...(typeof data.photoURL === "string" ? { photoURL: data.photoURL } : {}),
+    discoverable: data.discoverable === true,
+    ...(typeof data.publicProfileId === "string"
+      ? { publicProfileId: data.publicProfileId }
+      : {}),
     ...(legacyId ? { legacyDocumentId: legacyId } : {})
   };
 }
@@ -217,9 +256,26 @@ async function loadStudentProfile(user: User): Promise<StudentProfile> {
 
   try {
     await setDoc(profileRef, {
-      ...legacyData,
-      ...profileToDocument(profile),
-      updatedAt: serverTimestamp()
+      uid: user.uid,
+      fullName: profile.fullName,
+      username: profile.username,
+      email,
+      universityId: profile.universityId,
+      campusId: profile.campusId,
+      course: profile.course,
+      yearOfStudy: profile.yearOfStudy,
+      ...(profile.yearOfStudy ? { year: `Year ${profile.yearOfStudy}` } : {}),
+      role: "student",
+      emailVerified: user.emailVerified,
+      verificationStatus: "unverified",
+      createdAt: legacyData.createdAt ?? serverTimestamp(),
+      updatedAt: serverTimestamp(),
+      discoverable: legacyData.discoverable === true,
+      ...(typeof legacyData.publicProfileId === "string"
+        ? { publicProfileId: legacyData.publicProfileId }
+        : {}),
+      ...(profile.skills ? { skills: profile.skills } : {}),
+      ...(profile.photoURL ? { photoURL: profile.photoURL } : {})
     }, { merge: true });
     return profile;
   } catch (error) {
@@ -230,9 +286,11 @@ async function loadStudentProfile(user: User): Promise<StudentProfile> {
 }
 
 function clearAuthState() {
+  stopConnectionUiListeners();
   currentUser = null;
   currentProfile = null;
   currentRole = "student";
+  currentIsAdmin = false;
   currentUsername = null;
   currentEmail = null;
   authProfileError = null;
@@ -246,6 +304,7 @@ onAuthStateChanged(auth, async (user) => {
     return;
   }
 
+  stopConnectionUiListeners();
   if (pendingRegistrationProfile?.uid === user.uid) {
     showPendingRegistrationProfile();
     return;
@@ -258,11 +317,14 @@ onAuthStateChanged(auth, async (user) => {
 
     currentUser = user;
     currentProfile = profile;
-    currentRole = profile.role;
+    const token = await user.getIdTokenResult();
+    currentIsAdmin = token.claims.admin === true;
+    currentRole = currentIsAdmin ? "admin" : "student";
     currentUsername = profile.username;
     currentEmail = user.email;
     authProfileError = null;
     showApp();
+    void ensurePublicProfileRecord();
   } catch (error) {
     if (auth.currentUser?.uid !== user.uid) return;
     console.error("Could not load student profile:", error);
@@ -273,7 +335,7 @@ onAuthStateChanged(auth, async (user) => {
 });
 
 function isAdmin() {
-  return currentRole === "admin";
+  return currentIsAdmin;
 }
 
 function uniqueUserDocuments<T extends { id: string; data: () => DocumentData }>(
@@ -292,29 +354,433 @@ function uniqueUserDocuments<T extends { id: string; data: () => DocumentData }>
   return [...unique.values()];
 }
 
-async function findUserProfileDocument(
-  email: string,
-  uid?: string
-): Promise<ProfileDocument | null> {
-  if (uid) {
-    try {
-      const uidSnap = await getDoc(doc(db, "users", uid));
-      if (uidSnap.exists()) return { id: uidSnap.id, data: uidSnap.data() };
-    } catch (error) {
-      console.error("Could not read UID-keyed profile for chat contact:", error);
+function isConnectionStatus(value: unknown): value is ConnectionStatus {
+  return value === "pending" ||
+    value === "accepted" ||
+    value === "rejected" ||
+    value === "cancelled";
+}
+
+function toConnectionRecord(id: string, data: DocumentData): ConnectionRecord | null {
+  const participantUids = Array.isArray(data.participantUids)
+    ? data.participantUids.filter((uid: unknown): uid is string => typeof uid === "string")
+    : [];
+  const participantProfileIds = Array.isArray(data.participantProfileIds)
+    ? data.participantProfileIds.filter((profileId: unknown): profileId is string =>
+        typeof profileId === "string"
+      )
+    : [];
+  if (
+    participantUids.length !== 2 ||
+    participantUids[0] === participantUids[1] ||
+    typeof data.requesterUid !== "string" ||
+    typeof data.recipientUid !== "string" ||
+    !participantUids.includes(data.requesterUid) ||
+    !participantUids.includes(data.recipientUid) ||
+    !isConnectionStatus(data.status)
+  ) {
+    return null;
+  }
+  return {
+    id,
+    participantUids,
+    participantProfileIds,
+    requesterUid: data.requesterUid,
+    recipientUid: data.recipientUid,
+    status: data.status,
+    createdAt: data.createdAt,
+    updatedAt: data.updatedAt,
+    ...(typeof data.updatedByUid === "string" ? { updatedByUid: data.updatedByUid } : {}),
+    ...(isStudentProfileSnapshot(data.requesterProfile)
+      ? { requesterProfile: data.requesterProfile }
+      : {}),
+    ...(isStudentProfileSnapshot(data.recipientProfile)
+      ? { recipientProfile: data.recipientProfile }
+      : {})
+  };
+}
+
+function isStudentProfileSnapshot(value: unknown): value is StudentProfileSnapshot {
+  if (!value || typeof value !== "object") return false;
+  const profile = value as Record<string, unknown>;
+  return typeof profile.publicProfileId === "string" &&
+    typeof profile.fullName === "string" &&
+    typeof profile.username === "string" &&
+    typeof profile.universityId === "string" &&
+    typeof profile.course === "string" &&
+    (profile.yearOfStudy === null || typeof profile.yearOfStudy === "number") &&
+    typeof profile.skills === "string" &&
+    typeof profile.photoURL === "string";
+}
+
+function currentStudentUid(): string {
+  const uid = currentUser?.uid;
+  if (!uid || auth.currentUser?.uid !== uid) {
+    throw new Error("Your signed-in session is no longer available. Please sign in again.");
+  }
+  return uid;
+}
+
+function sortedParticipantUids(firstUid: string, secondUid: string): [string, string] {
+  return firstUid < secondUid ? [firstUid, secondUid] : [secondUid, firstUid];
+}
+
+function legacyConnectionIdFor(firstUid: string, secondUid: string): string {
+  return `pair_${encodeURIComponent(JSON.stringify(sortedParticipantUids(firstUid, secondUid)))}`;
+}
+
+function connectionIdFor(firstUid: string, secondUid: string): string {
+  const [first, second] = sortedParticipantUids(firstUid, secondUid);
+  return `pair_${first}~${second}`;
+}
+
+function publicProfileProjection(
+  data: Record<string, unknown>,
+  publicProfileId: string,
+  ownerUid: string
+): Record<string, unknown> {
+  return {
+    ownerUid,
+    publicProfileId,
+    fullName: typeof data.fullName === "string" ? data.fullName.slice(0, 100) : "",
+    username: typeof data.username === "string" ? data.username.slice(0, 30) : "",
+    universityId: typeof data.universityId === "string" ? data.universityId.slice(0, 100) : "",
+    course: typeof data.course === "string" ? data.course.slice(0, 120) : "",
+    yearOfStudy: Number.isInteger(data.yearOfStudy) ? data.yearOfStudy : null,
+    skills: typeof data.skills === "string" ? data.skills.slice(0, 500) : "",
+    photoURL: typeof data.photoURL === "string" && data.photoURL.length <= 700000
+      ? data.photoURL
+      : "",
+    discoverable: true
+  };
+}
+
+function publicSnapshot(
+  data: Record<string, unknown>,
+  publicProfileId: string
+): StudentProfileSnapshot {
+  const projection = publicProfileProjection(data, publicProfileId, "");
+  const photoURL = typeof projection.photoURL === "string" && projection.photoURL.length <= 150000
+    ? projection.photoURL
+    : "";
+  const yearOfStudy = projection.yearOfStudy;
+  return {
+    publicProfileId,
+    fullName: String(projection.fullName),
+    username: String(projection.username),
+    universityId: String(projection.universityId),
+    course: String(projection.course),
+    yearOfStudy: typeof yearOfStudy === "number" ? yearOfStudy : null,
+    skills: String(projection.skills),
+    photoURL
+  };
+}
+
+async function updateStudentConnection(
+  targetPublicProfileId: string,
+  action: ConnectionAction,
+  knownConnection: ConnectionRecord | null = null
+): Promise<ConnectionStatus> {
+  const uid = currentStudentUid();
+  const userRef = doc(db, "users", uid);
+  const targetProfileRef = doc(db, "publicProfiles", targetPublicProfileId);
+
+  return runTransaction(db, async (transaction) => {
+    const userSnapshot = await transaction.get(userRef);
+    if (!userSnapshot.exists()) throw new Error("Your student profile is not available.");
+    const userData = userSnapshot.data();
+    const ownProfileId = typeof userData.publicProfileId === "string"
+      ? userData.publicProfileId
+      : currentProfile?.publicProfileId;
+    if (!ownProfileId) throw new Error("Your public student profile is still being prepared.");
+
+    let targetUid = knownConnection?.participantUids.find((participantUid) => participantUid !== uid);
+    let targetData: Record<string, unknown> | null = null;
+    if (!targetUid || action === "request") {
+      const targetSnapshot = await transaction.get(targetProfileRef);
+      if (!targetSnapshot.exists() || targetSnapshot.data().discoverable !== true) {
+        throw new Error("This student is no longer available for a connection request.");
+      }
+      targetData = targetSnapshot.data();
+      const projectedUid = targetData.ownerUid;
+      if (typeof projectedUid !== "string" || projectedUid === uid) {
+        throw new Error("This student profile is not available for connections.");
+      }
+      if (targetUid && targetUid !== projectedUid) {
+        throw new Error("The connection profile identity changed. Reload and try again.");
+      }
+      targetUid = projectedUid;
+    }
+    if (!targetUid || targetUid === uid) {
+      throw new Error("You cannot connect with yourself.");
+    }
+
+    const legacyRef = doc(db, "connections", legacyConnectionIdFor(uid, targetUid));
+    const currentRef = doc(db, "connections", connectionIdFor(uid, targetUid));
+    const knownRef = knownConnection ? doc(db, "connections", knownConnection.id) : null;
+    const refs = [...new Set([legacyRef.path, currentRef.path, ...(knownRef ? [knownRef.path] : [])])]
+      .map((path) => doc(db, path));
+    const snapshots = await Promise.all(refs.map((ref) => transaction.get(ref)));
+    const found = snapshots.flatMap((snapshot) => {
+      if (!snapshot.exists()) return [];
+      const record = toConnectionRecord(snapshot.id, snapshot.data());
+      if (!record) {
+        throw new Error("An existing connection record is malformed and needs review.");
+      }
+      return [{ ref: snapshot.ref, record }];
+    });
+    if (found.length > 1) {
+      throw new Error("Duplicate connection records need review before they can be changed.");
+    }
+    const existing = found[0] ?? null;
+    if (existing && (
+      !existing.record.participantUids.includes(uid) ||
+      !existing.record.participantUids.includes(targetUid)
+    )) {
+      throw new Error("This connection record has invalid participants.");
+    }
+
+    const participantUids = sortedParticipantUids(uid, targetUid);
+    const currentProfileId = targetPublicProfileId;
+    const participantProfileIds = existing?.record.participantProfileIds.length === 2
+      ? existing.record.participantProfileIds
+      : participantUids.map((participantUid) =>
+          participantUid === uid ? ownProfileId : currentProfileId
+        );
+    const ownSnapshot = publicSnapshot(userData, ownProfileId);
+    const targetSnapshot = targetData
+      ? publicSnapshot(targetData, targetPublicProfileId)
+      : null;
+    let requesterUid = existing?.record.requesterUid ?? uid;
+    let recipientUid = existing?.record.recipientUid ?? targetUid;
+    let nextStatus: ConnectionStatus;
+
+    if (!existing) {
+      if (action !== "request" || !targetSnapshot) {
+        throw new Error("This connection request is not available.");
+      }
+      nextStatus = "pending";
+    } else if (action === "request") {
+      if (existing.record.status === "pending") {
+        if (existing.record.requesterUid === uid) return existing.record.status;
+        if (existing.record.recipientUid !== uid) {
+          throw new Error("This connection request is not available to you.");
+        }
+        nextStatus = "accepted";
+      } else {
+        if (!targetSnapshot) {
+          throw new Error("This student is no longer available for a connection request.");
+        }
+        requesterUid = uid;
+        recipientUid = targetUid;
+        nextStatus = "pending";
+      }
+    } else if (action === "accept" || action === "reject") {
+      if (existing.record.recipientUid !== uid || existing.record.status !== "pending") {
+        throw new Error("Only the recipient can respond to a pending request.");
+      }
+      nextStatus = action === "accept" ? "accepted" : "rejected";
+    } else if (action === "cancel") {
+      if (existing.record.requesterUid !== uid || existing.record.status !== "pending") {
+        throw new Error("Only the requester can cancel a pending request.");
+      }
+      nextStatus = "cancelled";
+    } else {
+      if (existing.record.status !== "accepted") {
+        throw new Error("Only an accepted connection can be removed.");
+      }
+      nextStatus = "cancelled";
+    }
+
+    const updatedAt = serverTimestamp();
+    if (existing) {
+      const updates: Record<string, unknown> = {
+        status: nextStatus,
+        updatedAt,
+        updatedByUid: uid
+      };
+      if (nextStatus === "pending" && existing.record.status !== "pending") {
+        updates.requesterUid = requesterUid;
+        updates.recipientUid = recipientUid;
+        if (!targetSnapshot) {
+          throw new Error("The target profile could not be loaded.");
+        }
+        updates.requesterProfile = requesterUid === uid ? ownSnapshot : targetSnapshot;
+        updates.recipientProfile = recipientUid === uid ? ownSnapshot : targetSnapshot;
+      }
+      transaction.update(existing.ref, updates);
+    } else {
+      if (!targetSnapshot) throw new Error("The target profile could not be loaded.");
+      transaction.set(currentRef, {
+        pairId: currentRef.id,
+        participantUids,
+        participantProfileIds,
+        requesterUid: uid,
+        recipientUid: targetUid,
+        requesterProfile: ownSnapshot,
+        recipientProfile: targetSnapshot,
+        status: nextStatus,
+        createdAt: updatedAt,
+        updatedAt,
+        updatedByUid: uid
+      });
+    }
+    return nextStatus;
+  });
+}
+
+async function loadPublicProfilesById(profileIds: string[]): Promise<Map<string, DocumentData>> {
+  const uniqueIds = [...new Set(profileIds)];
+  const profiles = new Map<string, DocumentData>();
+  for (let index = 0; index < uniqueIds.length; index += 30) {
+    const chunk = uniqueIds.slice(index, index + 30);
+    if (!chunk.length) continue;
+    const snapshot = await getDocs(
+      query(
+        collection(db, "publicProfiles"),
+        where("discoverable", "==", true),
+        where(documentId(), "in", chunk)
+      )
+    );
+    for (const profile of snapshot.docs) {
+      profiles.set(profile.id, profile.data());
     }
   }
+  return profiles;
+}
 
-  const legacySnap = await getDoc(doc(db, "users", email));
-  if (legacySnap.exists()) return { id: legacySnap.id, data: legacySnap.data() };
+function stopConnectionScreenListener(): void {
+  connectionScreenUnsubscribe?.();
+  connectionScreenUnsubscribe = null;
+}
 
-  const matchingProfiles = await getDocs(
-    query(collection(db, "users"), where("email", "==", email))
+function stopProfileConnectionListener(): void {
+  profileConnectionUnsubscribe?.();
+  profileConnectionUnsubscribe = null;
+}
+
+function stopStudentDiscoveryListener(): void {
+  studentDiscoveryUnsubscribe?.();
+  studentDiscoveryUnsubscribe = null;
+  discoveryConnectionsUnsubscribe?.();
+  discoveryConnectionsUnsubscribe = null;
+}
+
+function stopConnectionUiListeners(): void {
+  stopStudentDiscoveryListener();
+  stopConnectionScreenListener();
+  stopProfileConnectionListener();
+}
+
+function connectionActionFor(
+  connection: ConnectionRecord | null,
+  uid: string,
+  otherProfileId: string
+): { label: string; action: ConnectionAction | null } {
+  if (!connection || connection.status === "cancelled") {
+    return { label: "Connect", action: "request" };
+  }
+  if (connection.status === "accepted") {
+    return { label: "Connected", action: null };
+  }
+  if (connection.status === "rejected") {
+    return { label: "Request Rejected · Send again", action: "request" };
+  }
+  if (
+    connection.participantProfileIds.includes(otherProfileId) &&
+    connection.requesterUid === uid
+  ) {
+    return { label: "Request Sent", action: "cancel" };
+  }
+  if (
+    connection.participantProfileIds.includes(otherProfileId) &&
+    connection.recipientUid === uid
+  ) {
+    return { label: "Accept Request", action: "accept" };
+  }
+  return { label: "Connection unavailable", action: null };
+}
+
+function subscribeConnectionAction(targetPublicProfileId: string, container: HTMLElement): () => void {
+  container.replaceChildren();
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "connection-action-button";
+  button.disabled = true;
+  button.textContent = "Loading connection...";
+  const feedback = document.createElement("span");
+  feedback.className = "connection-action-feedback";
+  feedback.setAttribute("role", "status");
+  container.append(button, feedback);
+
+  let connection: ConnectionRecord | null = null;
+  let operationPending = false;
+  const relationshipQuery = query(
+    collection(db, "connections"),
+    where("participantUids", "array-contains", currentStudentUid())
   );
-  const matchingProfile = matchingProfiles.docs.find((profile) => profile.id !== email);
-  return matchingProfile
-    ? { id: matchingProfile.id, data: matchingProfile.data() }
-    : null;
+  const render = () => {
+    const state = connectionActionFor(
+      connection,
+      currentUser?.uid ?? "",
+      targetPublicProfileId
+    );
+    button.textContent = state.label;
+    button.disabled = operationPending || !state.action;
+    button.classList.toggle("connection-action-primary", state.action === "request");
+    button.classList.toggle("connection-action-muted", !state.action || state.action === "cancel");
+  };
+
+  button.addEventListener("click", async () => {
+    const state = connectionActionFor(
+      connection,
+      currentUser?.uid ?? "",
+      targetPublicProfileId
+    );
+    if (!state.action || operationPending) return;
+    operationPending = true;
+    feedback.textContent = "";
+    feedback.classList.remove("connection-action-error");
+    render();
+    try {
+      const result = await updateStudentConnection(
+        targetPublicProfileId,
+        state.action,
+        connection
+      );
+      feedback.textContent = result === "accepted"
+        ? "You are now connected."
+        : state.action === "request"
+          ? "Connection request sent."
+          : state.action === "accept"
+            ? "Connection request accepted."
+            : "Connection request cancelled.";
+    } catch (error) {
+      console.error("Could not update student connection:", error);
+      feedback.textContent = error instanceof Error ? error.message : authErrorMessage(error);
+      feedback.classList.add("connection-action-error");
+    } finally {
+      operationPending = false;
+      render();
+    }
+  });
+
+  return onSnapshot(
+    relationshipQuery,
+    (snapshot) => {
+      connection = snapshot.docs
+        .map((item) => toConnectionRecord(item.id, item.data()))
+        .find((item) => item?.participantProfileIds.includes(targetPublicProfileId)) ?? null;
+      render();
+    },
+    (error) => {
+      console.error("Could not load student connection:", error);
+      button.disabled = true;
+      button.textContent = "Connection status unavailable";
+      feedback.textContent = "Could not load connection status. Please retry.";
+      feedback.classList.add("connection-action-error");
+    }
+  );
 }
 
 function renderAccountStatus(feedback?: string, isError = false): void {
@@ -370,68 +836,12 @@ function renderAccountStatus(feedback?: string, isError = false): void {
           return;
         }
 
-        try {
-          await setDoc(doc(db, "users", refreshedUser.uid), {
-            emailVerified: true,
-            updatedAt: serverTimestamp()
-          }, { merge: true });
-        } catch (error) {
-          console.error("Could not sync verified email status to UID profile:", error);
-          renderAccountStatus(
-            "Firebase confirms your email is verified, but the canonical student profile could not be updated. The legacy profile was not changed.",
-            true
-          );
-          return;
-        }
-
         if (currentProfile) {
           currentProfile = { ...currentProfile, emailVerified: true };
         }
 
-        const legacyDocumentId =
-          currentProfile?.legacyDocumentId ?? refreshedUser.email;
-        if (!legacyDocumentId || legacyDocumentId === refreshedUser.uid) {
-          renderAccountStatus(
-            "Email verified and the canonical UID profile was updated. No separate legacy profile could be identified."
-          );
-          return;
-        }
-
-        let legacyProfileExists: boolean;
-        try {
-          const legacySnap = await getDoc(doc(db, "users", legacyDocumentId));
-          legacyProfileExists = legacySnap.exists();
-        } catch (error) {
-          console.error("Could not check for a legacy email profile:", error);
-          renderAccountStatus(
-            "Email verified and the canonical UID profile was updated, but the legacy profile could not be checked or synchronized.",
-            true
-          );
-          return;
-        }
-
-        if (legacyProfileExists) {
-          try {
-            await setDoc(doc(db, "users", legacyDocumentId), {
-              emailVerified: true,
-              updatedAt: serverTimestamp()
-            }, { merge: true });
-          } catch (error) {
-            console.error("Could not sync verified email status to legacy profile:", error);
-            renderAccountStatus(
-              "Email verified and the canonical UID profile was updated, but the existing legacy profile could not be synchronized.",
-              true
-            );
-            return;
-          }
-          renderAccountStatus(
-            "Email verified and synchronized to the canonical and legacy profiles. University student verification is separate."
-          );
-          return;
-        }
-
         renderAccountStatus(
-          "Email verified and the canonical UID profile was updated. No legacy email-keyed profile was found. University student verification is separate."
+          "Email verified. Firebase Authentication remains the source of truth for this status. University student verification is separate."
         );
       } catch (error) {
         console.error("Could not refresh email verification status:", error);
@@ -517,7 +927,9 @@ function showProfileLoadError(): void {
       if (auth.currentUser?.uid !== user.uid) return;
       currentUser = user;
       currentProfile = profile;
-      currentRole = profile.role;
+      const token = await user.getIdTokenResult();
+      currentIsAdmin = token.claims.admin === true;
+      currentRole = currentIsAdmin ? "admin" : "student";
       currentUsername = profile.username;
       currentEmail = user.email;
       authProfileError = null;
@@ -549,6 +961,7 @@ function completeRegistration(user: User, profile: StudentProfile): void {
   authProfileError = null;
   pendingRegistrationProfile = null;
   showApp();
+  void ensurePublicProfileRecord();
 
   void sendEmailVerification(user).then(
     () => renderAccountStatus("A verification email has been sent. Verify your email address; university student verification is separate."),
@@ -733,6 +1146,7 @@ function showRegister() {
         role: "student",
         emailVerified: credential.user.emailVerified,
         verificationStatus: "unverified",
+        discoverable: false,
         createdAt: now,
         updatedAt: now
       };
@@ -920,21 +1334,21 @@ function animateCountUp(el: HTMLElement, target: number, duration = 1200) {
 
 async function loadDashboardStats() {
   try {
-    const [usersSnap, hostelsSnap, annSnap] = await Promise.all([
-      getDocs(collection(db, "users")),
+    const [publicProfilesSnap, hostelsSnap, annSnap] = await Promise.all([
+      getDocs(query(collection(db, "publicProfiles"), where("discoverable", "==", true))),
       getDocs(collection(db, "hostels")),
-      getDocs(collection(db, "announcements")),
+      getDocs(collection(db, "announcements"))
     ]);
 
-    const userCount = uniqueUserDocuments(usersSnap.docs).length;
     const stats: Record<string, number> = {
       hostels: hostelsSnap.size,
       announcements: annSnap.size,
-      active: userCount,
+      active: publicProfilesSnap.size,
     };
 
     if (isAdmin()) {
-      stats.users = userCount;
+      const usersSnap = await getDocs(collection(db, "users"));
+      stats.users = uniqueUserDocuments(usersSnap.docs).length;
     }
 
     Object.entries(stats).forEach(([key, value]) => {
@@ -1065,12 +1479,16 @@ function openReportModal() {
 function initBottomNav() {
   const nav = document.querySelector(".bottom-nav");
   if (!nav) return;
-  const [home, chat, map, ann, profile] = nav.querySelectorAll("button");
+  const [home, chat, map, ann, profile, discover, connections, requests] =
+    nav.querySelectorAll("button");
   home?.addEventListener("click", showApp);
   chat?.addEventListener("click", openChatModule);
   map?.addEventListener("click", showMapScreen);
   ann?.addEventListener("click", openAnnouncements);
   profile?.addEventListener("click", showProfile);
+  discover?.addEventListener("click", showDiscoverStudents);
+  connections?.addEventListener("click", showMyConnections);
+  requests?.addEventListener("click", showConnectionRequests);
 }
 
 function bindLogout() {
@@ -1086,6 +1504,7 @@ function bindLogout() {
 
 /* ---------------- MAIN APP — ROYAL ACADEMIC DASHBOARD ---------------- */
 function showApp() {
+  stopConnectionUiListeners();
   const admin = isAdmin();
   const cardClass =
     "bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl hover:bg-white/10 hover:scale-[1.02] hover:border-purple-500/50 transition-all duration-300";
@@ -1182,6 +1601,18 @@ function showApp() {
           <span class="text-3xl">🗺️</span>
           <span class="text-sm font-semibold">Campus Map</span>
         </button>
+        <button id="discoverModule" class="${cardClass} flex flex-col items-center justify-center gap-2 p-7 cursor-pointer border-none text-inherit font-[inherit]">
+          <span class="text-3xl">🔎</span>
+          <span class="text-sm font-semibold">Discover Students</span>
+        </button>
+        <button id="connectionsModule" class="${cardClass} flex flex-col items-center justify-center gap-2 p-7 cursor-pointer border-none text-inherit font-[inherit]">
+          <span class="text-3xl">🤝</span>
+          <span class="text-sm font-semibold">My Connections</span>
+        </button>
+        <button id="requestsModule" class="${cardClass} flex flex-col items-center justify-center gap-2 p-7 cursor-pointer border-none text-inherit font-[inherit]">
+          <span class="text-3xl">📨</span>
+          <span class="text-sm font-semibold">Connection Requests</span>
+        </button>
       </div>
 
       <h2 class="text-xs font-bold tracking-[0.25em] ${textGrad} mb-4 pl-1">MANAGE DETAILS</h2>
@@ -1208,6 +1639,9 @@ function showApp() {
       <button aria-label="Map" class="bg-transparent border-none text-2xl cursor-pointer p-2 rounded-xl hover:bg-white/10 hover:scale-110 transition-all duration-200 m-0">🗺️</button>
       <button aria-label="Announcements" class="bg-transparent border-none text-2xl cursor-pointer p-2 rounded-xl hover:bg-white/10 hover:scale-110 transition-all duration-200 m-0">📢</button>
       <button aria-label="Profile" class="bg-transparent border-none text-2xl cursor-pointer p-2 rounded-xl hover:bg-white/10 hover:scale-110 transition-all duration-200 m-0">👤</button>
+      <button aria-label="Discover students" class="bg-transparent border-none text-2xl cursor-pointer p-2 rounded-xl hover:bg-white/10 hover:scale-110 transition-all duration-200 m-0">🔎</button>
+      <button aria-label="My connections" class="bg-transparent border-none text-2xl cursor-pointer p-2 rounded-xl hover:bg-white/10 hover:scale-110 transition-all duration-200 m-0">🤝</button>
+      <button aria-label="Connection requests" class="bg-transparent border-none text-2xl cursor-pointer p-2 rounded-xl hover:bg-white/10 hover:scale-110 transition-all duration-200 m-0">📨</button>
     </nav>
 
     <div class="fixed bottom-24 right-5 z-50 flex flex-col items-end gap-3">
@@ -1233,6 +1667,9 @@ function showApp() {
   document.getElementById("chatModule")?.addEventListener("click", openChatModule);
   document.getElementById("mapModule")?.addEventListener("click", showMapScreen);
   document.getElementById("annModule")?.addEventListener("click", openAnnouncements);
+  document.getElementById("discoverModule")?.addEventListener("click", showDiscoverStudents);
+  document.getElementById("connectionsModule")?.addEventListener("click", showMyConnections);
+  document.getElementById("requestsModule")?.addEventListener("click", showConnectionRequests);
   initBottomNav();
   initBuzzFab();
   renderAccountStatus(
@@ -1245,6 +1682,7 @@ function showApp() {
 
 
 function openChatModule() {
+  stopConnectionUiListeners();
   app.innerHTML = `
     <div class="wa-container">
 
@@ -1272,7 +1710,10 @@ function openChatModule() {
 }
 /* ---------------- USERS LIST ---------------- */
 function loadUsers() {
-  const usersRef = collection(db, "users");
+  const usersRef = query(
+    collection(db, "publicProfiles"),
+    where("discoverable", "==", true)
+  );
   const usersList = document.getElementById("usersList");
 
   if (!usersList) return;
@@ -1283,11 +1724,7 @@ function loadUsers() {
     uniqueUserDocuments(snapshot.docs).forEach((docSnap) => {
       const user = docSnap.data();
 
-      if (
-        typeof user.email !== "string" ||
-        user.email === currentEmail ||
-        user.uid === currentUser?.uid
-      ) return;
+      if (docSnap.id === currentProfile?.publicProfileId) return;
 
       const div = document.createElement("div");
       div.className = "wa-user";
@@ -1300,21 +1737,106 @@ function loadUsers() {
       `;
 
       div.onclick = () => openChat(
-        user.email,
-        user.username || user.fullName || "Student",
-        typeof user.uid === "string" ? user.uid : docSnap.id
+        docSnap.id,
+        user.username || user.fullName || "Student"
       );
 
       usersList.appendChild(div);
     });
+  }, (error) => {
+    console.error("Could not load chat contacts:", error);
+    usersList.textContent = "Student contacts could not be loaded.";
   });
 }
 
 /* ---------------- OPEN CHAT ---------------- */
-function openChat(otherEmail: string, username: string, otherUid?: string) {
+async function ensureStudentChat(publicProfileId: string): Promise<string> {
+  const uid = currentStudentUid();
+  const userRef = doc(db, "users", uid);
+  const existingChats = await getDocs(query(
+    collection(db, "chats"),
+    where("participantUids", "array-contains", uid)
+  ));
+  const existingByProfile = existingChats.docs.find((chat) => {
+    const data = chat.data();
+    if (
+      !Array.isArray(data.participantUids) ||
+      data.participantUids.length !== 2 ||
+      !data.participantUids.includes(uid) ||
+      !Array.isArray(data.participantProfileIds) ||
+      data.participantProfileIds.length !== 2
+    ) {
+      return false;
+    }
+    const ownIndex = data.participantUids.indexOf(uid);
+    const otherIndex = ownIndex === 0 ? 1 : 0;
+    return data.participantProfileIds[otherIndex] === publicProfileId;
+  });
+  if (existingByProfile) return existingByProfile.id;
 
-  const chatId = getChatId(currentEmail!, otherEmail);
+  const targetProfileRef = doc(db, "publicProfiles", publicProfileId);
+  const targetSnapshot = await getDoc(targetProfileRef);
+  if (!targetSnapshot.exists() || targetSnapshot.data().discoverable !== true) {
+    throw new Error("This student is no longer available for chat.");
+  }
+  const targetData = targetSnapshot.data();
+  const targetUid = targetData.ownerUid;
+  if (typeof targetUid !== "string" || targetUid === uid) {
+    throw new Error("This student profile is not available for chat.");
+  }
 
+  const participantUids = sortedParticipantUids(uid, targetUid);
+  const ownProfileId = currentProfile?.publicProfileId;
+  if (!ownProfileId) {
+    throw new Error("Your public student profile is still being prepared.");
+  }
+  const participantProfileIds = participantUids.map((participantUid) =>
+    participantUid === uid ? ownProfileId : publicProfileId
+  );
+  const chatId = `chat_${participantUids[0]}~${participantUids[1]}`;
+  const chatRef = doc(db, "chats", chatId);
+
+  return runTransaction(db, async (transaction) => {
+    const [userSnapshot, currentTarget, chatSnapshot] = await Promise.all([
+      transaction.get(userRef),
+      transaction.get(targetProfileRef),
+      transaction.get(chatRef)
+    ]);
+    if (!userSnapshot.exists() || !currentTarget.exists()) {
+      throw new Error("A student profile is no longer available for chat.");
+    }
+    if (
+      userSnapshot.data().publicProfileId !== participantProfileIds[participantUids.indexOf(uid)] ||
+      currentTarget.data().ownerUid !== targetUid ||
+      currentTarget.data().discoverable !== true
+    ) {
+      throw new Error("A student profile changed while opening the chat. Reload and try again.");
+    }
+    if (chatSnapshot.exists()) {
+      const existing = chatSnapshot.data();
+      if (
+        !Array.isArray(existing.participantUids) ||
+        existing.participantUids.length !== 2 ||
+        !existing.participantUids.includes(uid) ||
+        !existing.participantUids.includes(targetUid)
+      ) {
+        throw new Error("This chat record has invalid participants.");
+      }
+      return chatSnapshot.id;
+    }
+
+    const timestamp = serverTimestamp();
+    transaction.set(chatRef, {
+      participantUids,
+      participantProfileIds,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    });
+    return chatId;
+  });
+}
+
+function openChat(otherPublicProfileId: string, username: string) {
   const chatArea = document.getElementById("chatArea")!;
 
   chatArea.innerHTML = `
@@ -1340,37 +1862,46 @@ function openChat(otherEmail: string, username: string, otherUid?: string) {
 
   document.getElementById("backBtn")?.addEventListener("click", showApp);
 
-  document.getElementById("sendBtn")?.addEventListener("click", () => {
-    sendMessage(chatId);
-  });
-
+  const sendButton = document.getElementById("sendBtn") as HTMLButtonElement;
+  const messageInput = document.getElementById("msgInput") as HTMLInputElement;
+  sendButton.disabled = true;
+  messageInput.disabled = true;
   document.getElementById("viewProfileBtn")?.addEventListener("click", () => {
-    viewUserProfile(otherEmail, otherUid);
+    stopConnectionUiListeners();
+    void viewPublicStudentProfile(otherPublicProfileId, openChatModule);
   });
 
-  loadMessages(chatId);
+  void (async () => {
+    try {
+      const chatId = await ensureStudentChat(otherPublicProfileId);
+      if (!document.getElementById("messages")) return;
+      sendButton.disabled = false;
+      messageInput.disabled = false;
+      sendButton.addEventListener("click", () => {
+        void sendMessage(chatId);
+      });
+      loadMessages(chatId);
+    } catch (error) {
+      console.error("Could not open student chat:", error);
+      const messages = document.getElementById("messages");
+      if (messages) {
+        messages.textContent = "This chat could not be opened. Check your connection or try again.";
+      }
+    }
+  })();
 }
-/* ---------------- CHAT ID ---------------- */
-function getChatId(a: string, b: string) {
-  return [a, b].sort().join("_");
-}
-
 /* ---------------- SEND MESSAGE ---------------- */
 async function sendMessage(chatId: string) {
   const input = document.getElementById("msgInput") as HTMLInputElement;
 
-  if (!input.value.trim() || !currentEmail) return;
+  if (!input.value.trim() || !currentEmail || !currentUser) return;
 
   await addDoc(collection(db, "chats", chatId, "messages"), {
-  text: input.value,
-  sender: currentEmail,
-  createdAt: serverTimestamp()
-});
-input.value = "";
-input.placeholder = "Sending...";
-setTimeout(() => {
-  input.placeholder = "Type message...";
-}, 300);
+    text: input.value.trim(),
+    sender: currentEmail,
+    senderUid: currentUser.uid,
+    createdAt: serverTimestamp()
+  });
   input.value = "";
 }
 /* ---------------- LOAD MESSAGES ---------------- */
@@ -1653,6 +2184,7 @@ function showMapScreen() {
     rent,
     water,
     wifi,
+    ownerUid: currentStudentUid(),
     lat: loc.lat,
     lng: loc.lng,
     distanceKm: route.distanceKm,
@@ -1902,6 +2434,7 @@ document.getElementById("saveHostelBtn")?.addEventListener("click", async () => 
       rent,
       water,
       wifi,
+      ownerUid: currentStudentUid(),
       lat: loc.lat,
       lng: loc.lng,
       distanceKm: route.distanceKm,
@@ -1965,6 +2498,7 @@ function setupHostelForm() {
         rent,
         water,
         wifi,
+        ownerUid: currentStudentUid(),
         lat: loc.lat,
         lng: loc.lng,
         distanceKm: route.distanceKm,
@@ -1982,115 +2516,1181 @@ function setupHostelForm() {
   });
 }
 function showProfile() {
+  stopConnectionUiListeners();
+  if (!currentProfile) return;
+
+  const profile = currentProfile;
+  const universityName =
+    enabledUniversities.find((university) => university.id === profile.universityId)?.name ??
+    (profile.universityId || "Not set");
+  const initials = profile.fullName
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part.charAt(0).toUpperCase())
+    .join("") || "?";
+
   app.innerHTML = `
     <div class="profile-page">
-
       <div class="profile-header">
-        <button id="backBtn">⬅</button>
-        <h2>My Profile</h2>
+        <button id="backBtn" class="profile-back" type="button" aria-label="Back to dashboard">←</button>
+        <div>
+          <p class="profile-eyebrow">CAMPUS CONNECT</p>
+          <h1>My Profile</h1>
+        </div>
       </div>
 
-      <div class="profile-card">
-        <img
-          id="profileImage"
-          src="https://via.placeholder.com/120"
-          class="profile-pic"
-        >
+      <div class="profile-layout">
+        <section class="profile-card profile-summary" aria-labelledby="profileName">
+          <div class="profile-identity">
+            <div class="profile-avatar" id="profileAvatar">
+              <span id="profileImageFallback" aria-hidden="true">${escapeHtml(initials)}</span>
+              <img id="profileImage" alt="${escapeHtml(profile.fullName)} profile photograph" hidden>
+            </div>
+            <div class="profile-identity-copy">
+              <p class="profile-eyebrow">STUDENT PROFILE</p>
+              <h2 id="profileName">${escapeHtml(profile.fullName || "Student")}</h2>
+              <p class="profile-username">@${escapeHtml(profile.username || "student")}</p>
+            </div>
+          </div>
 
-        <input type="file" id="photoInput">
+          <dl class="profile-details">
+            <div><dt>University</dt><dd>${escapeHtml(universityName)}</dd></div>
+            <div><dt>Course / programme</dt><dd>${escapeHtml(profile.course || "Not set")}</dd></div>
+            <div><dt>Year of study</dt><dd>${profile.yearOfStudy ? `Year ${profile.yearOfStudy}` : "Not set"}</dd></div>
+            <div><dt>Skills and interests</dt><dd class="profile-skills">${escapeHtml(profile.skills?.trim() || "Not set")}</dd></div>
+          </dl>
+        </section>
 
-        <input id="course" placeholder="Course">
-        
-        <select id="year">
-          <option value="">Select Year</option>
-          ${Array.from({ length: 8 }, (_, index) => `<option value="${index + 1}">Year ${index + 1}</option>`).join("")}
-        </select>
+        <section class="profile-card profile-editor" aria-labelledby="profileEditTitle">
+          <div class="profile-section-heading">
+            <div>
+              <p class="profile-eyebrow">YOUR DETAILS</p>
+              <h2 id="profileEditTitle">Edit profile</h2>
+            </div>
+            <span class="profile-editable-tag">Editable</span>
+          </div>
 
-        <textarea
-          id="skills"
-          placeholder="Skills e.g GIS, Coding, Design">
-        </textarea>
+          <form id="profileForm" class="profile-form">
+            <div class="profile-photo-field">
+              <div class="profile-avatar profile-avatar-small" id="profilePhotoPreview">
+                <span id="profilePhotoFallback" aria-hidden="true">${escapeHtml(initials)}</span>
+                <img id="profilePhotoImage" alt="Profile photograph preview" hidden>
+              </div>
+              <div class="profile-photo-control">
+                <label for="photoInput">Profile photograph</label>
+                <input id="photoInput" name="photo" type="file" accept="image/jpeg,image/png,image/webp">
+                <p class="profile-field-hint">JPEG, PNG or WebP. Maximum 10 MB; resized before saving.</p>
+              </div>
+            </div>
 
-        <button id="saveProfile">
-          Save Profile
-        </button>
-        <p id="profileFeedback" role="status" aria-live="polite"></p>
+            <div class="profile-form-field">
+              <label for="course">Course / programme</label>
+              <input id="course" name="course" type="text" maxlength="120" required>
+            </div>
 
+            <div class="profile-form-field">
+              <label for="year">Year of study</label>
+              <select id="year" name="yearOfStudy" required>
+                <option value="">Select year</option>
+                ${Array.from({ length: 8 }, (_, index) => `<option value="${index + 1}">Year ${index + 1}</option>`).join("")}
+              </select>
+            </div>
+
+            <div class="profile-form-field">
+              <label for="skills">Skills and interests</label>
+              <textarea id="skills" name="skills" maxlength="500" rows="4" placeholder="e.g. GIS, coding, design"></textarea>
+              <p class="profile-field-hint">Up to 500 characters.</p>
+            </div>
+
+            <div class="profile-discovery-setting">
+              <label class="profile-discovery-toggle" for="discoverable">
+                <span>
+                  <strong>Show my profile in Discover Students</strong>
+                  <span id="discoveryPreferenceDescription" class="profile-field-hint"></span>
+                </span>
+                <input id="discoverable" name="discoverable" type="checkbox" ${profile.discoverable ? "checked" : ""}>
+              </label>
+              <p id="discoveryPreferenceFeedback" class="profile-feedback" role="status" aria-live="polite"></p>
+            </div>
+
+            <div class="profile-form-actions">
+              <button id="discardProfile" class="profile-button profile-button-secondary" type="button">Discard changes</button>
+              <button id="saveProfile" class="profile-button profile-button-primary" type="submit">Save profile</button>
+            </div>
+            <p id="profileFeedback" class="profile-feedback" role="status" aria-live="polite"></p>
+          </form>
+        </section>
+
+        <section class="profile-card profile-account" aria-labelledby="accountInfoTitle">
+          <div class="profile-section-heading">
+            <div>
+              <p class="profile-eyebrow">ACCOUNT</p>
+              <h2 id="accountInfoTitle">Account information</h2>
+            </div>
+            <span class="profile-readonly-tag">Read only</span>
+          </div>
+          <p class="profile-field-hint">These account details are not editable here. University student verification remains deferred and is not required to use profile features.</p>
+          <dl class="profile-details profile-account-details">
+            <div><dt>Email</dt><dd>${escapeHtml(profile.email || "Not set")}</dd></div>
+            <div><dt>Firebase UID</dt><dd class="profile-uid">${escapeHtml(profile.uid)}</dd></div>
+            <div><dt>Role</dt><dd>${escapeHtml(profile.role)}</dd></div>
+            <div><dt>Email verification</dt><dd>${currentUser?.emailVerified ? "Verified" : "Not verified"}</dd></div>
+            <div><dt>University student verification</dt><dd>${escapeHtml(profile.verificationStatus)}</dd></div>
+          </dl>
+        </section>
       </div>
     </div>
   `;
 
-  document.getElementById("saveProfile")?.addEventListener("click", async (event) => {
-    const button = event.currentTarget as HTMLButtonElement;
-    const feedback = document.getElementById("profileFeedback");
-    const course = (document.getElementById("course") as HTMLInputElement).value.trim();
-    const yearOfStudyValue = (document.getElementById("year") as HTMLSelectElement).value;
-    const yearOfStudy = yearOfStudyValue ? Number(yearOfStudyValue) : null;
-    const skills = (document.getElementById("skills") as HTMLTextAreaElement).value.trim();
-    const file = (document.getElementById("photoInput") as HTMLInputElement).files?.[0];
+  const form = document.getElementById("profileForm") as HTMLFormElement;
+  const photoInput = document.getElementById("photoInput") as HTMLInputElement;
+  const photoImage = document.getElementById("profilePhotoImage") as HTMLImageElement;
+  const photoFallback = document.getElementById("profilePhotoFallback") as HTMLSpanElement;
+  const feedback = document.getElementById("profileFeedback") as HTMLParagraphElement;
+  const saveButton = document.getElementById("saveProfile") as HTMLButtonElement;
+  const discardButton = document.getElementById("discardProfile") as HTMLButtonElement;
+  const discoverableInput = document.getElementById("discoverable") as HTMLInputElement;
+  const discoveryDescription = document.getElementById("discoveryPreferenceDescription") as HTMLSpanElement;
+  const discoveryFeedback = document.getElementById("discoveryPreferenceFeedback") as HTMLParagraphElement;
+  let previewUrl: string | null = null;
+  let saving = false;
+  let savingDiscoveryPreference = false;
 
-    if (file && (!file.type.startsWith("image/") || file.size > 2 * 1024 * 1024)) {
-      if (feedback) feedback.textContent = "Choose an image smaller than 2 MB.";
-      return;
-    }
+  const setPhotoPreview = (photoUrl: string) => {
+    photoImage.hidden = !photoUrl;
+    photoFallback.hidden = Boolean(photoUrl);
+    if (photoUrl) photoImage.src = photoUrl;
+    else photoImage.removeAttribute("src");
+  };
+  const setFeedback = (message: string, isError = false) => {
+    feedback.textContent = message;
+    feedback.className = `profile-feedback${message ? (isError ? " profile-feedback-error" : " profile-feedback-success") : ""}`;
+  };
+  const releasePreview = () => {
+    if (!previewUrl) return;
+    URL.revokeObjectURL(previewUrl);
+    previewUrl = null;
+  };
+  const restoreProfileForm = (message: string) => {
+    (document.getElementById("course") as HTMLInputElement).value = profile.course;
+    (document.getElementById("year") as HTMLSelectElement).value =
+      profile.yearOfStudy?.toString() ?? "";
+    (document.getElementById("skills") as HTMLTextAreaElement).value = profile.skills ?? "";
+    photoInput.value = "";
+    releasePreview();
+    setPhotoPreview(profile.photoURL ?? "");
+    setFeedback(message);
+  };
 
-    button.disabled = true;
-    button.textContent = "Saving...";
+  (document.getElementById("course") as HTMLInputElement).value = profile.course;
+  (document.getElementById("year") as HTMLSelectElement).value =
+    profile.yearOfStudy?.toString() ?? "";
+  (document.getElementById("skills") as HTMLTextAreaElement).value = profile.skills ?? "";
+  setPhotoPreview(profile.photoURL ?? "");
+  const updateDiscoveryDescription = () => {
+    discoveryDescription.textContent = discoverableInput.checked
+      ? "Your public profile details will appear in student discovery."
+      : "Your profile is hidden from student discovery unless you turn this on.";
+  };
+  updateDiscoveryDescription();
+
+  discoverableInput.addEventListener("change", async () => {
+    if (savingDiscoveryPreference) return;
+    savingDiscoveryPreference = true;
+    discoverableInput.disabled = true;
+    discoveryFeedback.textContent = "";
     try {
-      let photoURL = currentProfile?.photoURL ?? "";
-      if (file) {
-        photoURL = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => {
-            if (typeof reader.result === "string") resolve(reader.result);
-            else reject(new Error("The selected image could not be read."));
-          };
-          reader.onerror = () => reject(reader.error ?? new Error("The selected image could not be read."));
-          reader.readAsDataURL(file);
-        });
-      }
-
-      await saveStudentProfileChanges({
-        course,
-        yearOfStudy,
-        skills,
-        photoURL,
-        year: yearOfStudy ? `Year ${yearOfStudy}` : ""
-      });
-      if (feedback) {
-        feedback.textContent = "Profile saved.";
-        feedback.className = "auth-feedback auth-feedback-success";
-      }
+      const legacySynchronized = await saveStudentDiscoveryPreference(discoverableInput.checked);
+      updateDiscoveryDescription();
+      discoveryFeedback.textContent = legacySynchronized
+        ? "Discovery preference saved."
+        : "Preference saved to your UID profile, but its legacy email-keyed copy could not be synchronized.";
+      discoveryFeedback.className = `profile-feedback${legacySynchronized ? "" : " profile-feedback-error"}`;
     } catch (error) {
-      console.error("Could not save student profile:", error);
-      if (feedback) {
-        feedback.textContent = `Profile could not be saved. ${authErrorMessage(error)}`;
-        feedback.className = "auth-feedback auth-feedback-error";
-      }
+      console.error("Could not save student discovery preference:", error);
+      discoverableInput.checked = currentProfile?.discoverable ?? false;
+      updateDiscoveryDescription();
+      discoveryFeedback.textContent =
+        `Discovery preference could not be saved. ${error instanceof Error ? error.message : authErrorMessage(error)}`;
+      discoveryFeedback.className = "profile-feedback profile-feedback-error";
     } finally {
-      button.disabled = false;
-      button.textContent = "Save Profile";
+      savingDiscoveryPreference = false;
+      discoverableInput.disabled = false;
     }
   });
 
-  document.getElementById("backBtn")
-    ?.addEventListener("click", showApp);
+  photoInput.addEventListener("change", () => {
+    releasePreview();
+    const file = photoInput.files?.[0];
+    if (!file) {
+      setPhotoPreview(profile.photoURL ?? "");
+      setFeedback("");
+      return;
+    }
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+      photoInput.value = "";
+      setPhotoPreview(profile.photoURL ?? "");
+      setFeedback("Choose a JPEG, PNG or WebP image.", true);
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      photoInput.value = "";
+      setPhotoPreview(profile.photoURL ?? "");
+      setFeedback("Choose an image smaller than 10 MB.", true);
+      return;
+    }
+    previewUrl = URL.createObjectURL(file);
+    setPhotoPreview(previewUrl);
+    setFeedback("Photo preview ready. Save profile to apply it.");
+  });
 
-  loadProfile();
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (saving || !form.reportValidity()) return;
+
+    const courseInput = document.getElementById("course") as HTMLInputElement;
+    const yearInput = document.getElementById("year") as HTMLSelectElement;
+    const skillsInput = document.getElementById("skills") as HTMLTextAreaElement;
+    const course = courseInput.value.trim();
+    const yearOfStudy = Number(yearInput.value);
+    const skills = skillsInput.value.trim();
+    const file = photoInput.files?.[0];
+
+    if (!course || course.length > 120) {
+      setFeedback("Enter a course or programme name (up to 120 characters).", true);
+      courseInput.focus();
+      return;
+    }
+    if (!Number.isInteger(yearOfStudy) || yearOfStudy < 1 || yearOfStudy > 8) {
+      setFeedback("Select a valid year of study.", true);
+      yearInput.focus();
+      return;
+    }
+    if (skills.length > 500) {
+      setFeedback("Skills and interests must be 500 characters or fewer.", true);
+      skillsInput.focus();
+      return;
+    }
+
+    saving = true;
+    saveButton.disabled = true;
+    discardButton.disabled = true;
+    photoInput.disabled = true;
+    saveButton.textContent = file ? "Preparing photo..." : "Saving...";
+    setFeedback("");
+    try {
+      const changes: ProfileEdits = { course, yearOfStudy, skills };
+      if (file) {
+        changes.photoURL = await compressProfileImage(file);
+        saveButton.textContent = "Saving...";
+      }
+
+      await saveStudentProfileChanges(changes);
+      releasePreview();
+      photoInput.value = "";
+      showProfile();
+      const updatedFeedback = document.getElementById("profileFeedback");
+      if (updatedFeedback) {
+        updatedFeedback.textContent = "Profile saved successfully.";
+        updatedFeedback.className = "profile-feedback profile-feedback-success";
+      }
+    } catch (error) {
+      console.error("Could not save student profile:", error);
+      const message =
+        typeof error === "object" && error !== null && "code" in error
+          ? authErrorMessage(error)
+          : error instanceof Error
+            ? error.message
+            : authErrorMessage(error);
+      setFeedback(`Profile could not be saved. ${message}`, true);
+    } finally {
+      saving = false;
+      saveButton.disabled = false;
+      discardButton.disabled = false;
+      photoInput.disabled = false;
+      saveButton.textContent = "Save profile";
+    }
+  });
+
+  discardButton.addEventListener("click", () => restoreProfileForm("Unsaved changes discarded."));
+  document.getElementById("backBtn")?.addEventListener("click", showApp);
+
+  photoImage.addEventListener("error", () => {
+    photoImage.hidden = true;
+    photoFallback.hidden = false;
+  });
+}
+
+function networkStudentFromDocument(
+  publicProfileId: string,
+  data: DocumentData
+): DiscoverableStudent {
+  return {
+    publicProfileId,
+    fullName: String(data.fullName ?? data.username ?? "Student"),
+    username: String(data.username ?? data.fullName ?? "student"),
+    universityId: String(data.universityId ?? pilotUniversityId),
+    course: String(data.course ?? ""),
+    yearOfStudy: normalizeYearOfStudy(data.yearOfStudy ?? data.year),
+    skills: typeof data.skills === "string" ? data.skills : "",
+    photoURL: typeof data.photoURL === "string" ? data.photoURL : ""
+  };
+}
+
+function studentFromConnection(
+  connection: ConnectionRecord,
+  participantUid: string,
+  publicProfiles: Map<string, DocumentData>
+): DiscoverableStudent | null {
+  const index = connection.participantUids.indexOf(participantUid);
+  if (index < 0) return null;
+  const publicProfileId = connection.participantProfileIds[index];
+  if (!publicProfileId) return null;
+  const publicProfile = publicProfiles.get(publicProfileId);
+  if (publicProfile) return networkStudentFromDocument(publicProfileId, publicProfile);
+  const snapshot = participantUid === connection.requesterUid
+    ? connection.requesterProfile
+    : connection.recipientProfile;
+  return snapshot ? networkStudentFromDocument(publicProfileId, snapshot) : null;
+}
+
+function createNetworkStudentCard(
+  student: DiscoverableStudent,
+  onProfile: () => void
+): HTMLElement {
+  const card = document.createElement("article");
+  card.className = "network-student-card";
+  const avatar = document.createElement("span");
+  avatar.className = "discover-avatar";
+  const initials = student.fullName
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part.charAt(0).toUpperCase())
+    .join("") || "?";
+  const fallback = document.createElement("span");
+  fallback.textContent = initials;
+  avatar.appendChild(fallback);
+
+  if (student.photoURL) {
+    const image = document.createElement("img");
+    image.src = student.photoURL;
+    image.alt = "";
+    image.addEventListener("error", () => image.remove());
+    image.addEventListener("load", () => fallback.remove());
+    avatar.appendChild(image);
+  }
+
+  const details = document.createElement("div");
+  details.className = "discover-student-details";
+  const name = document.createElement("strong");
+  name.className = "discover-student-name";
+  name.textContent = student.fullName;
+  const username = document.createElement("span");
+  username.className = "discover-student-username";
+  username.textContent = `@${student.username}`;
+  const university = document.createElement("span");
+  university.className = "discover-student-meta";
+  university.textContent =
+    enabledUniversities.find((item) => item.id === student.universityId)?.name ??
+    student.universityId;
+  const course = document.createElement("span");
+  course.className = "discover-student-meta";
+  course.textContent = [
+    student.course || "Course not set",
+    student.yearOfStudy ? `Year ${student.yearOfStudy}` : ""
+  ].filter(Boolean).join(" · ");
+  details.append(name, username, course, university);
+
+  const profileButton = document.createElement("button");
+  profileButton.type = "button";
+  profileButton.className = "discover-profile-button";
+  profileButton.textContent = "View profile";
+  profileButton.addEventListener("click", onProfile);
+  card.append(avatar, details, profileButton);
+  return card;
+}
+
+async function showMyConnections(): Promise<void> {
+  stopConnectionUiListeners();
+  const uid = currentStudentUid();
+  app.innerHTML = `
+    <main class="network-page">
+      <header class="discover-header">
+        <button id="connectionsBack" class="profile-back" type="button" aria-label="Back to dashboard">←</button>
+        <div>
+          <p class="profile-eyebrow">YOUR STUDENT NETWORK</p>
+          <h1>My Connections</h1>
+          <p id="connectionsCount" class="discover-intro">Loading connections...</p>
+        </div>
+      </header>
+      <p id="connectionsStatus" class="discover-status" role="status" aria-live="polite">
+        <span class="discover-spinner" aria-hidden="true"></span>Loading your connections...
+      </p>
+      <div id="connectionsError" class="discover-status discover-status-error" role="alert" hidden></div>
+      <section id="connectionsList" class="network-list" aria-label="Accepted student connections"></section>
+    </main>
+  `;
+
+  const count = document.getElementById("connectionsCount") as HTMLParagraphElement;
+  const status = document.getElementById("connectionsStatus") as HTMLParagraphElement;
+  const error = document.getElementById("connectionsError") as HTMLDivElement;
+  const list = document.getElementById("connectionsList") as HTMLElement;
+  let renderGeneration = 0;
+  let previousUids: string | null = null;
+
+  document.getElementById("connectionsBack")?.addEventListener("click", showApp);
+  if (!document.getElementById("connectionsList")) return;
+  connectionScreenUnsubscribe = onSnapshot(
+    query(collection(db, "connections"), where("participantUids", "array-contains", uid)),
+    async (snapshot) => {
+      const accepted = snapshot.docs
+        .map((item) => toConnectionRecord(item.id, item.data()))
+        .filter((item): item is ConnectionRecord =>
+          Boolean(item && item.status === "accepted" && item.participantUids.includes(uid))
+        );
+      const otherProfileIds = accepted
+        .map((connection) => {
+          const index = connection.participantUids.findIndex(
+            (participantUid) => participantUid !== uid
+          );
+          return connection.participantProfileIds[index];
+        })
+        .filter((profileId): profileId is string => Boolean(profileId))
+        .sort();
+      const signature = otherProfileIds.join("|");
+      count.textContent = `${accepted.length} ${accepted.length === 1 ? "connection" : "connections"}`;
+      error.hidden = true;
+
+      if (signature === previousUids) return;
+      previousUids = signature;
+      const generation = ++renderGeneration;
+      list.replaceChildren();
+
+      if (!otherProfileIds.length) {
+        status.hidden = true;
+        const empty = document.createElement("p");
+        empty.className = "discover-empty";
+        empty.textContent = "You do not have any connections yet. Discover students to grow your network.";
+        list.appendChild(empty);
+        return;
+      }
+
+      status.hidden = false;
+      status.innerHTML = '<span class="discover-spinner" aria-hidden="true"></span>Loading connection profiles...';
+      try {
+        const profiles = await loadPublicProfilesById(otherProfileIds);
+        if (generation !== renderGeneration) return;
+        status.hidden = true;
+        for (const publicProfileId of otherProfileIds) {
+          const connection = accepted.find((item) =>
+            item.participantProfileIds.includes(publicProfileId)
+          );
+          if (!connection) continue;
+          const otherIndex = connection.participantProfileIds.indexOf(publicProfileId);
+          const otherUid = connection.participantUids[otherIndex];
+          const student = studentFromConnection(connection, otherUid, profiles);
+          if (!student) continue;
+          const card = createNetworkStudentCard(student, () => {
+            stopConnectionScreenListener();
+            void viewStudentProfileFromConnection(student, showMyConnections);
+          });
+          const removeButton = document.createElement("button");
+          removeButton.type = "button";
+          removeButton.className = "connection-remove-button";
+          removeButton.textContent = "Remove connection";
+          const feedback = document.createElement("span");
+          feedback.className = "connection-action-feedback";
+          feedback.setAttribute("role", "status");
+          removeButton.addEventListener("click", async () => {
+            if (!window.confirm(`Remove ${student.fullName} from your connections? Your profile and chat history will not be deleted.`)) {
+              return;
+            }
+            removeButton.disabled = true;
+            feedback.textContent = "";
+            try {
+              await updateStudentConnection(
+                student.publicProfileId,
+                "remove",
+                connection
+              );
+              feedback.textContent = "Connection removed.";
+            } catch (actionError) {
+              console.error("Could not remove student connection:", actionError);
+              feedback.textContent = actionError instanceof Error
+                ? actionError.message
+                : authErrorMessage(actionError);
+              feedback.classList.add("connection-action-error");
+              removeButton.disabled = false;
+            }
+          });
+          card.append(removeButton, feedback);
+          list.appendChild(card);
+        }
+
+        if (!list.childElementCount) {
+          const empty = document.createElement("p");
+          empty.className = "discover-empty";
+          empty.textContent = "Your connections are saved, but their profiles are unavailable.";
+          list.appendChild(empty);
+        }
+      } catch (loadError) {
+        if (generation !== renderGeneration) return;
+        console.error("Could not load connected student profiles:", loadError);
+        status.hidden = true;
+        error.textContent = "Your connections loaded, but student profiles could not be retrieved. Try again.";
+        error.hidden = false;
+      }
+    },
+    (listenerError) => {
+      console.error("Could not load student connections:", listenerError);
+      status.hidden = true;
+      error.textContent = "Your connections could not be loaded. Check your connection or Firestore access, then try again.";
+      error.hidden = false;
+    }
+  );
+}
+
+function showConnectionRequests(): void {
+  stopConnectionUiListeners();
+  const uid = currentStudentUid();
+  app.innerHTML = `
+    <main class="network-page">
+      <header class="discover-header">
+        <button id="requestsBack" class="profile-back" type="button" aria-label="Back to dashboard">←</button>
+        <div>
+          <p class="profile-eyebrow">YOUR STUDENT NETWORK</p>
+          <h1>Connection Requests</h1>
+          <p class="discover-intro">Review incoming requests and manage the ones you have sent.</p>
+        </div>
+      </header>
+      <div id="requestsError" class="discover-status discover-status-error" role="alert" hidden></div>
+      <section class="network-request-section" aria-labelledby="incomingRequestsTitle">
+        <div class="network-section-heading">
+          <h2 id="incomingRequestsTitle">Incoming requests</h2>
+          <span id="incomingRequestCount" class="network-count">0</span>
+        </div>
+        <p id="incomingRequestsEmpty" class="discover-empty">Loading incoming requests...</p>
+        <div id="incomingRequests" class="network-list"></div>
+      </section>
+      <section class="network-request-section" aria-labelledby="outgoingRequestsTitle">
+        <div class="network-section-heading">
+          <h2 id="outgoingRequestsTitle">Outgoing requests</h2>
+          <span id="outgoingRequestCount" class="network-count">0</span>
+        </div>
+        <p id="outgoingRequestsEmpty" class="discover-empty">Loading outgoing requests...</p>
+        <div id="outgoingRequests" class="network-list"></div>
+      </section>
+    </main>
+  `;
+
+  document.getElementById("requestsBack")?.addEventListener("click", showApp);
+  const incomingList = document.getElementById("incomingRequests") as HTMLElement;
+  const outgoingList = document.getElementById("outgoingRequests") as HTMLElement;
+  const incomingEmpty = document.getElementById("incomingRequestsEmpty") as HTMLParagraphElement;
+  const outgoingEmpty = document.getElementById("outgoingRequestsEmpty") as HTMLParagraphElement;
+  const incomingCount = document.getElementById("incomingRequestCount") as HTMLSpanElement;
+  const outgoingCount = document.getElementById("outgoingRequestCount") as HTMLSpanElement;
+  const error = document.getElementById("requestsError") as HTMLDivElement;
+  let renderGeneration = 0;
+  let previousRequestSignature: string | null = null;
+
+  void (async () => {
+    try {
+      if (!document.getElementById("incomingRequests")) return;
+      connectionScreenUnsubscribe = onSnapshot(
+        query(collection(db, "connections"), where("participantUids", "array-contains", uid)),
+        async (snapshot) => {
+          const records = snapshot.docs
+            .map((item) => toConnectionRecord(item.id, item.data()))
+            .filter((item): item is ConnectionRecord => Boolean(item));
+          const incoming = records.filter(
+            (connection) => connection.status === "pending" && connection.recipientUid === uid
+          );
+          const outgoing = records.filter(
+            (connection) => connection.status === "pending" && connection.requesterUid === uid
+          );
+          incomingCount.textContent = String(incoming.length);
+          outgoingCount.textContent = String(outgoing.length);
+          const profileIds = [...new Set([
+            ...incoming.flatMap((connection) => connection.participantProfileIds),
+            ...outgoing.flatMap((connection) => connection.participantProfileIds)
+          ])].sort();
+          const signature = `${incoming.map((item) => item.id).sort().join(",")}|${outgoing.map((item) => item.id).sort().join(",")}`;
+          error.hidden = true;
+          if (signature === previousRequestSignature) return;
+          previousRequestSignature = signature;
+          const generation = ++renderGeneration;
+          incomingList.replaceChildren();
+          outgoingList.replaceChildren();
+          incomingEmpty.hidden = incoming.length > 0;
+          outgoingEmpty.hidden = outgoing.length > 0;
+          incomingEmpty.textContent = incoming.length ? "Loading incoming requests..." : "No incoming requests.";
+          outgoingEmpty.textContent = outgoing.length ? "Loading outgoing requests..." : "No outgoing requests.";
+
+          if (!profileIds.length) return;
+
+          try {
+            const profiles = await loadPublicProfilesById(profileIds);
+            if (generation !== renderGeneration) return;
+            incomingEmpty.hidden = incoming.length > 0;
+            outgoingEmpty.hidden = outgoing.length > 0;
+            incomingEmpty.textContent = "No incoming requests.";
+            outgoingEmpty.textContent = "No outgoing requests.";
+
+            for (const connection of incoming) {
+              const student = studentFromConnection(connection, connection.requesterUid, profiles);
+              if (!student) continue;
+              const card = createNetworkStudentCard(student, () => {
+                stopConnectionScreenListener();
+                void viewStudentProfileFromConnection(student, showConnectionRequests);
+              });
+              const actions = document.createElement("div");
+              actions.className = "network-card-actions";
+              const feedback = document.createElement("span");
+              feedback.className = "connection-action-feedback";
+              feedback.setAttribute("role", "status");
+              for (const action of ["accept", "reject"] as const) {
+                const button = document.createElement("button");
+                button.type = "button";
+                button.className = action === "accept"
+                  ? "connection-action-button connection-action-primary"
+                  : "connection-remove-button";
+                button.textContent = action === "accept" ? "Accept" : "Reject";
+                button.addEventListener("click", async () => {
+                  button.disabled = true;
+                  for (const sibling of actions.querySelectorAll("button")) sibling.disabled = true;
+                  feedback.textContent = "";
+                  try {
+                    await updateStudentConnection(student.publicProfileId, action, connection);
+                    feedback.textContent = action === "accept"
+                      ? "Connection request accepted."
+                      : "Connection request rejected.";
+                  } catch (actionError) {
+                    console.error("Could not respond to student connection request:", actionError);
+                    feedback.textContent = actionError instanceof Error
+                      ? actionError.message
+                      : authErrorMessage(actionError);
+                    feedback.classList.add("connection-action-error");
+                    for (const sibling of actions.querySelectorAll("button")) sibling.disabled = false;
+                  }
+                });
+                actions.appendChild(button);
+              }
+              actions.appendChild(feedback);
+              card.appendChild(actions);
+              incomingList.appendChild(card);
+            }
+
+            for (const connection of outgoing) {
+              const student = studentFromConnection(connection, connection.recipientUid, profiles);
+              if (!student) continue;
+              const card = createNetworkStudentCard(student, () => {
+                stopConnectionScreenListener();
+                void viewStudentProfileFromConnection(student, showConnectionRequests);
+              });
+              const actions = document.createElement("div");
+              actions.className = "network-card-actions";
+              const pending = document.createElement("span");
+              pending.className = "network-pending-label";
+              pending.textContent = "Pending";
+              const cancelButton = document.createElement("button");
+              cancelButton.type = "button";
+              cancelButton.className = "connection-remove-button";
+              cancelButton.textContent = "Cancel request";
+              const feedback = document.createElement("span");
+              feedback.className = "connection-action-feedback";
+              feedback.setAttribute("role", "status");
+              cancelButton.addEventListener("click", async () => {
+                cancelButton.disabled = true;
+                feedback.textContent = "";
+                try {
+                  await updateStudentConnection(student.publicProfileId, "cancel", connection);
+                  feedback.textContent = "Connection request cancelled.";
+                } catch (actionError) {
+                  console.error("Could not cancel student connection request:", actionError);
+                  feedback.textContent = actionError instanceof Error
+                    ? actionError.message
+                    : authErrorMessage(actionError);
+                  feedback.classList.add("connection-action-error");
+                  cancelButton.disabled = false;
+                }
+              });
+              actions.append(pending, cancelButton, feedback);
+              card.appendChild(actions);
+              outgoingList.appendChild(card);
+            }
+
+            if (incoming.length && !incomingList.childElementCount) {
+              incomingEmpty.textContent = "Incoming request profiles are unavailable.";
+              incomingEmpty.hidden = false;
+            }
+            if (outgoing.length && !outgoingList.childElementCount) {
+              outgoingEmpty.textContent = "Outgoing request profiles are unavailable.";
+              outgoingEmpty.hidden = false;
+            }
+          } catch (loadError) {
+            if (generation !== renderGeneration) return;
+            console.error("Could not load request profiles:", loadError);
+            error.textContent = "Requests loaded, but student profiles could not be retrieved. Try again.";
+            error.hidden = false;
+            incomingEmpty.textContent = incoming.length ? "Could not load incoming request profiles." : "No incoming requests.";
+            outgoingEmpty.textContent = outgoing.length ? "Could not load outgoing request profiles." : "No outgoing requests.";
+            incomingEmpty.hidden = false;
+            outgoingEmpty.hidden = false;
+          }
+        },
+        (listenerError) => {
+          console.error("Could not load connection requests:", listenerError);
+          error.textContent = "Connection requests could not be loaded. Check your connection or Firestore access, then try again.";
+          error.hidden = false;
+          incomingEmpty.textContent = "Unable to load incoming requests.";
+          outgoingEmpty.textContent = "Unable to load outgoing requests.";
+          incomingEmpty.hidden = false;
+          outgoingEmpty.hidden = false;
+        }
+      );
+    } catch (loadError) {
+      console.error("Could not prepare connection requests:", loadError);
+      error.textContent = "Connection requests could not be prepared. Please try again.";
+      error.hidden = false;
+      incomingEmpty.textContent = "Unable to load incoming requests.";
+      outgoingEmpty.textContent = "Unable to load outgoing requests.";
+      incomingEmpty.hidden = false;
+      outgoingEmpty.hidden = false;
+    }
+  })();
+}
+
+function showDiscoverStudents(): void {
+  stopConnectionUiListeners();
+  app.innerHTML = `
+    <main class="discover-page">
+      <header class="discover-header">
+        <button id="discoverBack" class="profile-back" type="button" aria-label="Back to dashboard">←</button>
+        <div>
+          <p class="profile-eyebrow">CAMPUS CONNECT</p>
+          <h1>Discover Students</h1>
+          <p class="discover-intro">Find students who have chosen to share their profiles.</p>
+        </div>
+      </header>
+
+      <section class="discover-controls" aria-label="Search and filter students">
+        <label class="discover-search">
+          <span>Search students</span>
+          <input id="discoverSearch" type="search" placeholder="Search by name or username" autocomplete="off">
+        </label>
+        <label>
+          <span>University</span>
+          <select id="discoverUniversity"><option value="">All universities</option></select>
+        </label>
+        <label>
+          <span>Course</span>
+          <select id="discoverCourse"><option value="">All courses</option></select>
+        </label>
+        <label>
+          <span>Year of study</span>
+          <select id="discoverYear"><option value="">All years</option></select>
+        </label>
+        <button id="clearDiscoverFilters" class="discover-clear" type="button">Clear filters</button>
+      </section>
+
+      <p id="discoverStatus" class="discover-status" role="status" aria-live="polite"><span class="discover-spinner" aria-hidden="true"></span>Loading student profiles...</p>
+      <div id="discoverError" class="discover-status discover-status-error" role="alert" hidden></div>
+      <section id="discoverResults" class="discover-results" aria-label="Discoverable student profiles"></section>
+    </main>
+  `;
+
+  document.getElementById("discoverBack")?.addEventListener("click", () => {
+    stopStudentDiscoveryListener();
+    showApp();
+  });
+  const searchInput = document.getElementById("discoverSearch") as HTMLInputElement;
+  const universityFilter = document.getElementById("discoverUniversity") as HTMLSelectElement;
+  const courseFilter = document.getElementById("discoverCourse") as HTMLSelectElement;
+  const yearFilter = document.getElementById("discoverYear") as HTMLSelectElement;
+  const status = document.getElementById("discoverStatus") as HTMLParagraphElement;
+  const errorMessage = document.getElementById("discoverError") as HTMLDivElement;
+  const results = document.getElementById("discoverResults") as HTMLElement;
+  let students: DiscoverableStudent[] = [];
+  let relationships = new Map<string, ConnectionRecord>();
+
+  const buildOptions = (
+    select: HTMLSelectElement,
+    defaultLabel: string,
+    options: Array<{ value: string; label: string }>,
+    selectedValue: string
+  ) => {
+    select.innerHTML = `<option value="">${escapeHtml(defaultLabel)}</option>${options
+      .map((option) => `<option value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</option>`)
+      .join("")}`;
+    if (options.some((option) => option.value === selectedValue)) {
+      select.value = selectedValue;
+    }
+  };
+
+  const renderResults = () => {
+    const searchTerm = searchInput.value.trim().toLocaleLowerCase();
+    const universityId = universityFilter.value;
+    const course = courseFilter.value;
+    const year = yearFilter.value;
+    const matches = students.filter((student) => {
+      const matchesSearch =
+        !searchTerm ||
+        student.fullName.toLocaleLowerCase().includes(searchTerm) ||
+        student.username.toLocaleLowerCase().includes(searchTerm);
+      return (
+        matchesSearch &&
+        (!universityId || student.universityId === universityId) &&
+        (!course || student.course === course) &&
+        (!year || String(student.yearOfStudy ?? "") === year)
+      );
+    });
+
+    results.replaceChildren();
+    if (!matches.length) {
+      const emptyState = document.createElement("p");
+      emptyState.className = "discover-empty";
+      emptyState.textContent = students.length
+        ? "No students match these search terms or filters. Try clearing or adjusting them."
+        : "No students have chosen to appear in Discover Students yet.";
+      results.appendChild(emptyState);
+      return;
+    }
+
+    for (const student of matches) {
+      const universityName =
+        enabledUniversities.find((university) => university.id === student.universityId)?.name ??
+        student.universityId ??
+        "University not set";
+      const initials = student.fullName
+        .split(/\s+/)
+        .filter(Boolean)
+        .slice(0, 2)
+        .map((part) => part.charAt(0).toUpperCase())
+        .join("") || "?";
+      const card = document.createElement("article");
+      card.className = "discover-student-card";
+
+      const avatar = document.createElement("span");
+      avatar.className = "discover-avatar";
+      const fallback = document.createElement("span");
+      fallback.textContent = initials;
+      avatar.appendChild(fallback);
+      if (student.photoURL) {
+        const image = document.createElement("img");
+        image.src = student.photoURL;
+        image.alt = "";
+        image.addEventListener("error", () => image.remove());
+        image.addEventListener("load", () => fallback.remove());
+        avatar.appendChild(image);
+      }
+
+      const details = document.createElement("span");
+      details.className = "discover-student-details";
+      const name = document.createElement("strong");
+      name.className = "discover-student-name";
+      name.textContent = student.fullName;
+      const username = document.createElement("span");
+      username.className = "discover-student-username";
+      username.textContent = `@${student.username}`;
+      const university = document.createElement("span");
+      university.className = "discover-student-meta";
+      university.textContent = universityName;
+      const courseAndYear = document.createElement("span");
+      courseAndYear.className = "discover-student-meta";
+      courseAndYear.textContent = [
+        student.course || "Course not set",
+        student.yearOfStudy ? `Year ${student.yearOfStudy}` : ""
+      ].filter(Boolean).join(" · ");
+      details.append(name, username, university, courseAndYear);
+
+      if (student.skills) {
+        const skills = document.createElement("span");
+        skills.className = "discover-student-skills";
+        skills.textContent = student.skills;
+        details.appendChild(skills);
+      }
+      const actions = document.createElement("div");
+      actions.className = "discover-student-actions";
+      const profileButton = document.createElement("button");
+      profileButton.type = "button";
+      profileButton.className = "discover-profile-button";
+      profileButton.textContent = "View profile";
+      profileButton.addEventListener("click", () => {
+        stopConnectionUiListeners();
+        void viewPublicStudentProfile(student.publicProfileId, showDiscoverStudents);
+      });
+      actions.appendChild(profileButton);
+
+      const state = connectionActionFor(
+        relationships.get(student.publicProfileId) ?? null,
+        currentUser?.uid ?? "",
+        student.publicProfileId
+      );
+      const connectButton = document.createElement("button");
+      connectButton.type = "button";
+      connectButton.className = "connection-action-button";
+      connectButton.textContent = state.label;
+      connectButton.disabled = !state.action;
+      connectButton.classList.toggle("connection-action-primary", state.action === "request");
+      connectButton.classList.toggle("connection-action-muted", !state.action || state.action === "cancel");
+      const actionFeedback = document.createElement("span");
+      actionFeedback.className = "connection-action-feedback";
+      actionFeedback.setAttribute("role", "status");
+      connectButton.addEventListener("click", async () => {
+        const latestState = connectionActionFor(
+          relationships.get(student.publicProfileId) ?? null,
+          currentUser?.uid ?? "",
+          student.publicProfileId
+        );
+        if (!latestState.action || connectButton.disabled) return;
+        connectButton.disabled = true;
+        actionFeedback.textContent = "";
+        actionFeedback.classList.remove("connection-action-error");
+        try {
+          const result = await updateStudentConnection(
+            student.publicProfileId,
+            latestState.action,
+            relationships.get(student.publicProfileId) ?? null
+          );
+          actionFeedback.textContent = result === "accepted"
+            ? "You are now connected."
+            : latestState.action === "request"
+              ? "Request sent."
+              : latestState.action === "accept"
+                ? "Request accepted."
+                : "Request cancelled.";
+        } catch (error) {
+          console.error("Could not update student connection:", error);
+          actionFeedback.textContent = error instanceof Error ? error.message : authErrorMessage(error);
+          actionFeedback.classList.add("connection-action-error");
+        } finally {
+          connectButton.disabled = false;
+          const updatedState = connectionActionFor(
+            relationships.get(student.publicProfileId) ?? null,
+            currentUser?.uid ?? "",
+            student.publicProfileId
+          );
+          connectButton.textContent = updatedState.label;
+          connectButton.disabled = !updatedState.action;
+        }
+      });
+      actions.append(connectButton, actionFeedback);
+
+      card.append(avatar, details, actions);
+      card.addEventListener("click", (event) => {
+        if ((event.target as HTMLElement).closest("button")) return;
+        stopConnectionUiListeners();
+        void viewPublicStudentProfile(student.publicProfileId, showDiscoverStudents);
+      });
+      results.appendChild(card);
+    }
+  };
+
+  const updateFilters = () => {
+    const selectedUniversity = universityFilter.value;
+    const selectedCourse = courseFilter.value;
+    const selectedYear = yearFilter.value;
+    const universityIds = new Set([
+      ...enabledUniversities.map((university) => university.id),
+      ...students.map((student) => student.universityId).filter(Boolean)
+    ]);
+
+    buildOptions(
+      universityFilter,
+      "All universities",
+      [...universityIds].sort((a, b) => a.localeCompare(b)).map((id) => ({
+        value: id,
+        label: enabledUniversities.find((university) => university.id === id)?.name ?? id
+      })),
+      selectedUniversity
+    );
+    buildOptions(
+      courseFilter,
+      "All courses",
+      [...new Set(students.map((student) => student.course.trim()).filter(Boolean))]
+        .sort((a, b) => a.localeCompare(b))
+        .map((value) => ({ value, label: value })),
+      selectedCourse
+    );
+    buildOptions(
+      yearFilter,
+      "All years",
+      [...new Set(students.map((student) => student.yearOfStudy).filter(
+        (year): year is number => year !== null
+      ))]
+        .sort((a, b) => a - b)
+        .map((year) => ({ value: String(year), label: `Year ${year}` })),
+      selectedYear
+    );
+  };
+
+  searchInput.addEventListener("input", renderResults);
+  universityFilter.addEventListener("change", renderResults);
+  courseFilter.addEventListener("change", renderResults);
+  yearFilter.addEventListener("change", renderResults);
+  document.getElementById("clearDiscoverFilters")?.addEventListener("click", () => {
+    searchInput.value = "";
+    universityFilter.value = "";
+    courseFilter.value = "";
+    yearFilter.value = "";
+    renderResults();
+    searchInput.focus();
+  });
+
+  const discoverableQuery = query(
+    collection(db, "publicProfiles"),
+    where("discoverable", "==", true)
+  );
+  studentDiscoveryUnsubscribe = onSnapshot(
+    discoverableQuery,
+    (snapshot) => {
+      students = uniqueUserDocuments(snapshot.docs)
+        .filter((document) => {
+          const data = document.data();
+          const universityId = String(data.universityId ?? pilotUniversityId);
+          return (
+            data.discoverable === true &&
+            enabledUniversities.some((university) => university.id === universityId) &&
+            document.id !== currentProfile?.publicProfileId
+          );
+        })
+        .map((document) => {
+          const data = document.data();
+          return {
+            publicProfileId: document.id,
+            fullName: String(data.fullName ?? data.username ?? "Student"),
+            username: String(data.username ?? data.fullName ?? "student"),
+            universityId: String(data.universityId ?? pilotUniversityId),
+            course: String(data.course ?? ""),
+            yearOfStudy: normalizeYearOfStudy(data.yearOfStudy ?? data.year),
+            skills: typeof data.skills === "string" ? data.skills : "",
+            photoURL: typeof data.photoURL === "string" ? data.photoURL : ""
+          };
+        });
+
+      errorMessage.hidden = true;
+      status.hidden = true;
+      updateFilters();
+      renderResults();
+    },
+    (error) => {
+      console.error("Could not load discoverable student profiles:", error);
+      status.hidden = true;
+      results.replaceChildren();
+      errorMessage.textContent = "Student profiles could not be loaded. Check your connection or Firestore access, then try again.";
+      errorMessage.hidden = false;
+    }
+  );
+
+  discoveryConnectionsUnsubscribe = onSnapshot(
+    query(
+      collection(db, "connections"),
+      where("participantUids", "array-contains", currentStudentUid())
+    ),
+    (snapshot) => {
+      relationships = new Map<string, ConnectionRecord>();
+      for (const relationshipDocument of snapshot.docs) {
+        const connection = toConnectionRecord(
+          relationshipDocument.id,
+          relationshipDocument.data()
+        );
+        if (!connection) continue;
+        const otherIndex = connection.participantUids.findIndex((uid) => uid !== currentUser?.uid);
+        const otherProfileId = connection.participantProfileIds[otherIndex];
+        if (otherProfileId) relationships.set(otherProfileId, connection);
+      }
+      renderResults();
+    },
+    (error) => {
+      console.error("Could not load student connection states:", error);
+      errorMessage.textContent = "Student profiles loaded, but connection states could not be loaded.";
+      errorMessage.hidden = false;
+    }
+  );
+}
+
+type ProfileEdits = Pick<StudentProfile, "course" | "yearOfStudy" | "skills"> &
+  Partial<Pick<StudentProfile, "photoURL">>;
+
+const MAX_PROFILE_PHOTO_BYTES = 10 * 1024 * 1024;
+const MAX_COMPRESSED_PHOTO_BYTES = 500 * 1024;
+
+async function compressProfileImage(file: File): Promise<string> {
+  if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+    throw new Error("Choose a JPEG, PNG or WebP image.");
+  }
+  if (file.size > MAX_PROFILE_PHOTO_BYTES) {
+    throw new Error("Choose an image smaller than 10 MB.");
+  }
+
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const image = new Image();
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error("The selected image could not be opened."));
+      image.src = objectUrl;
+    });
+
+    if (!image.naturalWidth || !image.naturalHeight) {
+      throw new Error("The selected image has invalid dimensions.");
+    }
+
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Image processing is unavailable in this browser.");
+
+    const initialScale = Math.min(1, 512 / image.naturalWidth, 512 / image.naturalHeight);
+    let width = Math.max(1, Math.round(image.naturalWidth * initialScale));
+    let height = Math.max(1, Math.round(image.naturalHeight * initialScale));
+
+    for (let resizeAttempt = 0; resizeAttempt < 6; resizeAttempt += 1) {
+      canvas.width = width;
+      canvas.height = height;
+      context.fillStyle = "#ffffff";
+      context.fillRect(0, 0, width, height);
+      context.drawImage(image, 0, 0, width, height);
+
+      for (const quality of [0.82, 0.68, 0.54, 0.4]) {
+        const blob = await new Promise<Blob | null>((resolve) =>
+          canvas.toBlob(resolve, "image/jpeg", quality)
+        );
+        if (blob && blob.size <= MAX_COMPRESSED_PHOTO_BYTES) {
+          return await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => {
+              if (typeof reader.result === "string") resolve(reader.result);
+              else reject(new Error("The processed image could not be read."));
+            };
+            reader.onerror = () =>
+              reject(reader.error ?? new Error("The processed image could not be read."));
+            reader.readAsDataURL(blob);
+          });
+        }
+      }
+
+      width = Math.max(1, Math.floor(width * 0.75));
+      height = Math.max(1, Math.floor(height * 0.75));
+    }
+
+    throw new Error("This photo could not be compressed enough to save. Choose a different image.");
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
 }
 
 async function saveStudentProfileChanges(
-  changes: Partial<StudentProfile> & { year?: string }
+  changes: ProfileEdits
 ): Promise<void> {
   if (!currentUser || !currentProfile) throw new Error("No student profile is loaded.");
 
-  const profileChanges = { ...changes };
-  delete profileChanges.legacyDocumentId;
   const updatedAt = serverTimestamp();
   const updateData: Record<string, unknown> = {
-    ...profileChanges,
-    uid: currentUser.uid,
-    email: currentUser.email ?? currentProfile.email,
+    ...changes,
+    year: `Year ${changes.yearOfStudy}`,
     updatedAt
   };
 
@@ -2106,65 +3706,248 @@ async function saveStudentProfileChanges(
     );
     currentProfile = {
       ...currentProfile,
-      ...profileChanges,
+      ...changes,
       updatedAt
     };
     return;
   }
 
-  if (currentProfile.legacyDocumentId) {
-    await setDoc(doc(db, "users", currentProfile.legacyDocumentId), updateData, { merge: true });
-  }
-
   currentProfile = {
     ...currentProfile,
-    ...profileChanges,
+    ...changes,
     updatedAt
   };
-}
 
-async function loadProfile() {
-  if (!currentProfile) return;
-  (document.getElementById("course") as HTMLInputElement).value = currentProfile.course;
-  (document.getElementById("skills") as HTMLTextAreaElement).value = currentProfile.skills ?? "";
-  (document.getElementById("year") as HTMLSelectElement).value =
-    currentProfile.yearOfStudy?.toString() ?? "";
-
-  if (currentProfile.photoURL) {
-    const profileImage = document.getElementById("profileImage") as HTMLImageElement;
-    profileImage.src = currentProfile.photoURL;
+  if (currentProfile.legacyDocumentId) {
+    try {
+      await setDoc(doc(db, "users", currentProfile.legacyDocumentId), updateData, { merge: true });
+    } catch (error) {
+      console.error("Could not synchronize legacy email-keyed profile:", error);
+      throw new Error(
+        "Your UID profile was saved, but its legacy email-keyed copy could not be synchronized. Try saving again."
+      );
+    }
+  }
+  if (currentProfile.discoverable) {
+    try {
+      await syncPublicProfile();
+    } catch (error) {
+      console.error("Could not synchronize public student profile:", error);
+      throw new Error(
+        "Your private profile was saved, but its discoverable profile could not be updated."
+      );
+    }
   }
 }
-async function viewUserProfile(email: string, uid?: string) {
-  const profileDocument = await findUserProfileDocument(email, uid);
-  if (!profileDocument) return;
-  const user = profileDocument.data;
+
+async function ensurePublicProfileRecord(): Promise<void> {
+  if (!currentUser || !currentProfile) return;
+  try {
+    const uid = currentStudentUid();
+    const userRef = doc(db, "users", uid);
+    const publicProfileId = await runTransaction(db, async (transaction) => {
+      const profileSnapshot = await transaction.get(userRef);
+      if (!profileSnapshot.exists()) {
+        throw new Error("Your student profile is not available.");
+      }
+      const profileData = profileSnapshot.data();
+      const id = typeof profileData.publicProfileId === "string"
+        ? profileData.publicProfileId
+        : currentProfile?.publicProfileId ?? crypto.randomUUID();
+      const discoverable = profileData.discoverable === true;
+      if (profileData.publicProfileId !== id) {
+        transaction.update(userRef, {
+          publicProfileId: id,
+          updatedAt: serverTimestamp()
+        });
+      }
+      transaction.set(doc(db, "publicProfileOwners", id), { uid }, { merge: true });
+      if (discoverable) {
+        transaction.set(
+          doc(db, "publicProfiles", id),
+          publicProfileProjection(profileData, id, uid)
+        );
+      }
+      return id;
+    });
+    currentProfile = {
+      ...currentProfile,
+      publicProfileId,
+      discoverable: currentProfile.discoverable
+    };
+  } catch (error) {
+    console.error("Could not initialize public student profile metadata:", error);
+  }
+}
+
+async function syncPublicProfile(): Promise<void> {
+  if (!currentUser || !currentProfile) throw new Error("No student profile is loaded.");
+  if (!currentProfile.publicProfileId) await ensurePublicProfileRecord();
+  const uid = currentStudentUid();
+  const userRef = doc(db, "users", uid);
+  await runTransaction(db, async (transaction) => {
+    const profileSnapshot = await transaction.get(userRef);
+    if (!profileSnapshot.exists()) throw new Error("Your student profile is not available.");
+    const data = profileSnapshot.data();
+    const id = data.publicProfileId;
+    if (typeof id !== "string") {
+      throw new Error("Your public student profile is still being prepared.");
+    }
+    if (data.discoverable !== true) return;
+    transaction.set(
+      doc(db, "publicProfiles", id),
+      publicProfileProjection(data, id, uid)
+    );
+    transaction.set(doc(db, "publicProfileOwners", id), { uid }, { merge: true });
+  });
+}
+
+async function saveStudentDiscoveryPreference(discoverable: boolean): Promise<boolean> {
+  if (!currentUser || !currentProfile) throw new Error("No student profile is loaded.");
+
+  if (!currentProfile.publicProfileId) await ensurePublicProfileRecord();
+  const uid = currentStudentUid();
+  const userRef = doc(db, "users", uid);
+  const updatedAt = serverTimestamp();
+  const publicProfileId = await runTransaction(db, async (transaction) => {
+    const profileSnapshot = await transaction.get(userRef);
+    if (!profileSnapshot.exists()) throw new Error("Your student profile is not available.");
+    const data = profileSnapshot.data();
+    const id = data.publicProfileId;
+    if (typeof id !== "string") {
+      throw new Error("Your public student profile is still being prepared.");
+    }
+    transaction.update(userRef, { discoverable, updatedAt });
+    const ownerRef = doc(db, "publicProfileOwners", id);
+    transaction.set(ownerRef, { uid }, { merge: true });
+    if (discoverable) {
+      transaction.set(
+        doc(db, "publicProfiles", id),
+        publicProfileProjection({ ...data, discoverable }, id, uid)
+      );
+    } else {
+      transaction.delete(doc(db, "publicProfiles", id));
+    }
+    return id;
+  });
+  currentProfile = { ...currentProfile, discoverable, publicProfileId };
+
+  if (currentProfile.legacyDocumentId) {
+    await setDoc(doc(db, "users", currentProfile.legacyDocumentId), {
+      discoverable,
+      updatedAt
+    }, { merge: true });
+  }
+  return true;
+}
+
+async function viewPublicStudentProfile(
+  publicProfileId: string,
+  onBack: () => void = openChatModule
+): Promise<void> {
+  stopProfileConnectionListener();
+  let profileData: DocumentData | null = null;
+  try {
+    const profileSnapshot = await getDoc(doc(db, "publicProfiles", publicProfileId));
+    if (profileSnapshot.exists() && profileSnapshot.data().discoverable === true) {
+      profileData = profileSnapshot.data();
+    }
+  } catch (error) {
+    console.error("Could not load student profile:", error);
+    showUnavailableStudentProfile(
+      onBack,
+      "This student profile could not be loaded. Check your connection and try again."
+    );
+    return;
+  }
+  if (!profileData) {
+    showUnavailableStudentProfile(onBack, "This student profile is no longer available.");
+    return;
+  }
+  renderStudentProfileView(profileData, publicProfileId, onBack);
+}
+
+function viewStudentProfileFromConnection(
+  student: DiscoverableStudent,
+  onBack: () => void
+): void {
+  stopProfileConnectionListener();
+  renderStudentProfileView(student, student.publicProfileId, onBack);
+}
+
+function showUnavailableStudentProfile(onBack: () => void, message: string): void {
+  app.innerHTML = `
+    <div class="profile-page">
+      <button id="backBtn" class="profile-back" type="button">← Back</button>
+      <p class="discover-status discover-status-error" role="alert">${escapeHtml(message)}</p>
+    </div>
+  `;
+  document.getElementById("backBtn")?.addEventListener("click", onBack);
+}
+
+function renderStudentProfileView(
+  user: DocumentData,
+  publicProfileId: string,
+  onBack: () => void
+): void {
+  const ownProfile = publicProfileId === currentProfile?.publicProfileId;
+  const universityId = String(user.universityId ?? pilotUniversityId);
+  const universityName =
+    enabledUniversities.find((university) => university.id === universityId)?.name ??
+    universityId;
 
   app.innerHTML = `
     <div class="profile-page">
-
-      <button id="backBtn">⬅ Back</button>
-
-      <div class="profile-card">
-
-        <img
-          src="${escapeHtml(user.photoURL || 'https://via.placeholder.com/120')}"
-          class="profile-pic"
-        >
-
-        <h2>${escapeHtml(user.username || user.fullName || "Student")}</h2>
-
-        <p><b>Course:</b> ${escapeHtml(user.course || "Not set")}</p>
-
-        <p><b>Year:</b> ${escapeHtml(user.yearOfStudy ?? user.year ?? "Not set")}</p>
-
-        <p><b>Skills:</b> ${escapeHtml(user.skills || "Not set")}</p>
-
-      </div>
-
+      <header class="profile-header">
+        <button id="backBtn" class="profile-back" type="button" aria-label="Back">←</button>
+        <div>
+          <p class="profile-eyebrow">CAMPUS CONNECT</p>
+          <h1>Student Profile</h1>
+        </div>
+      </header>
+      <section class="profile-card profile-summary profile-public-view">
+        <div class="profile-identity">
+          <div class="profile-avatar">
+            <span id="publicProfileFallback" aria-hidden="true">${escapeHtml(
+              String(user.fullName ?? user.username ?? "Student")
+                .split(/\s+/)
+                .filter(Boolean)
+                .slice(0, 2)
+                .map((part: string) => part.charAt(0).toUpperCase())
+                .join("") || "?"
+            )}</span>
+            ${typeof user.photoURL === "string" && user.photoURL
+              ? `<img src="${escapeHtml(user.photoURL)}" alt="${escapeHtml(user.fullName || "Student")} profile photograph">`
+              : ""}
+          </div>
+          <div class="profile-identity-copy">
+            <p class="profile-eyebrow">STUDENT</p>
+            <h2>${escapeHtml(user.fullName || user.username || "Student")}</h2>
+            <p class="profile-username">@${escapeHtml(user.username || "student")}</p>
+          </div>
+        </div>
+        <dl class="profile-details">
+          <div><dt>University</dt><dd>${escapeHtml(universityName)}</dd></div>
+          <div><dt>Course / programme</dt><dd>${escapeHtml(user.course || "Not set")}</dd></div>
+          <div><dt>Year of study</dt><dd>${escapeHtml(normalizeYearOfStudy(user.yearOfStudy ?? user.year) ?? "Not set")}</dd></div>
+          <div><dt>Skills and interests</dt><dd class="profile-skills">${escapeHtml(user.skills || "Not set")}</dd></div>
+        </dl>
+        ${ownProfile ? "" : `
+          <div class="profile-connection-actions" id="profileConnectionActions"></div>
+        `}
+      </section>
     </div>
   `;
 
   document.getElementById("backBtn")
-    ?.addEventListener("click", openChatModule);
+    ?.addEventListener("click", () => {
+      stopProfileConnectionListener();
+      onBack();
+    });
+  if (!ownProfile) {
+    const actions = document.getElementById("profileConnectionActions");
+    if (actions) {
+      profileConnectionUnsubscribe = subscribeConnectionAction(publicProfileId, actions);
+    }
+  }
 }
